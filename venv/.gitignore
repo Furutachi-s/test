@@ -1,0 +1,26 @@
+# VSCode の設定を無視
+.vscode/
+
+# 仮想環境関連ファイルを無視
+.venv/
+venv/
+
+# MLflow の実験結果フォルダを無視
+mlruns/
+
+# 大きなデータファイルや一時ファイルを無視
+*.csv
+*.html
+
+# Jupyter Notebook のチェックポイントを無視
+.ipynb_checkpoints/
+
+# __pycache__ フォルダ（Python のキャッシュファイル）を無視
+__pycache__/
+
+# 環境ファイルなどの機密情報を含む設定ファイルを無視（必要に応じて）
+*.env
+config.json
+
+# その他不要なファイルやフォルダを無視
+portalSandbox/
