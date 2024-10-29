@@ -7,9 +7,9 @@ from io import BytesIO
 import json
 import tiktoken
 import base64
-from pymupdf4llm import to_markdown  # PyMuPDF4LLMのto_markdown関数をインポート
 import time  # 処理時間計測のため追加
 import re
+import unicodedata  # テキスト正規化のため追加
 
 # 環境変数からAPIキーとエンドポイントを取得
 key = os.getenv("AZURE_OPENAI_KEY")
@@ -32,23 +32,29 @@ def check_text_with_openai(text, page_num):
 
     prompt = f"""
 あなたには建設機械のマニュアルをチェックしてもらいます（該当ページ: {page_num}）。
-以下の項目についてチェックし、指摘してください: 
-(1) 誤字
-(2) 文脈的に、記載内容が明確に間違っている場合
-(3) 文法が致命的に間違っていて、文章として意味が通らない場合
 
-ただし、以下の項目については指摘しないこと:
-(1) 偽陽性を避けるため、判断に迷った場合は指摘しない
-(2) 不自然な空白、半角スペースはPDF抽出時の仕様のため、指摘しない
+**指摘すべき項目**:
+1. 明らかな誤字・脱字
+2. 文法的に誤っており、意味が通じない文章
+3. 文脈上、明らかに間違っている内容
 
-重要なポイント
-・偽陽性を避けるため、判断に迷った場合は指摘しないでください。
-・各指摘については、以下の形式でJSONとして返し、JSON以外の文字列を一切含めないでください。コードブロックや追加の説明も含めないでください。
-- "page": 該当ページ番号
-- "category": 指摘のカテゴリ（例: 誤字、文法、文脈）
-- "reason": 指摘した理由（簡潔に記述）
-- "error_location": 指摘箇所
-- "context": 周辺テキスト
+**指摘しない項目**:
+1. PDF抽出時の不自然な改行やスペース
+2. 表や図のレイアウトによる文字のズレ
+3. カタカナ語の末尾に関する特例について:
+   - 英語の語尾 "-er"、"-or"、"-ar"、"-y" に相当するカタカナ語は、基本的に長音符号「ー」を用いて表記します。
+   - ただし、長音符号を除いた音節数が3以上の場合、最後の長音符号を省略することがあります。この場合、指摘は不要です。
+   - **例：** バッテリ（OK）、スクリュ（OK）
+
+**重要な注意事項**:
+- 判断に迷う場合や不確かな場合は指摘しないでください。
+- 出力は以下のJSON形式で返してください。追加の説明やテキストは含めないでください。
+- 各指摘には以下の情報を含めてください：
+  - "page": 該当ページ番号
+  - "category": 指摘のカテゴリ（例: "誤字", "文法エラー", "文脈エラー"）
+  - "reason": 指摘した理由を簡潔に記述
+  - "error_location": 指摘箇所（具体的な単語やフレーズ）
+  - "context": 周辺のテキスト
 
 以下の文章についてチェックを行ってください：
 
@@ -62,9 +68,9 @@ def check_text_with_openai(text, page_num):
     for attempt in range(3):  # 最大3回リトライ
         try:
             response = client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-4o",
                 seed=42,
-                temperature=0,
+                temperature=0.1,
                 max_tokens=2000,
                 messages=session_message
             )
@@ -79,30 +85,32 @@ def check_text_with_openai(text, page_num):
     chat_history[-1]["response"] = f"エラー: {e}"
     return ""
 
-# 画像をBase64形式でエンコードして埋め込む関数
-def encode_image_to_base64(image):
-    image_stream = BytesIO()
-    image.save(image_stream, format="PNG")  # PNG形式で保存
-    image_base64 = base64.b64encode(image_stream.getvalue()).decode('utf-8')
-    return f"![Embedded Image](data:image/png;base64,{image_base64})"
+# テキスト前処理関数
+def preprocess_text(text):
+    # Unicode正規化
+    text = unicodedata.normalize('NFKC', text)
+    # 不要な改行とスペースを削除
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
 
-# PyMuPDF4LLMを使用してPDFを解析し、ページごとにテキストを抽出する関数
-def extract_text_with_pymupdf4llm(pdf_document):
+# 画像内の文字列を除外してPDFを解析し、ページごとにテキストを抽出する関数
+def extract_text_without_images(pdf_document):
     page_texts = []
     for page_num in range(len(pdf_document)):
         try:
-            st.write(f"ページ {page_num + 1} を処理しています...")
             # ページの処理時間を計測開始
             page_start_time = time.time()
-            # ドキュメント全体を渡し、pagesパラメータでページを指定
-            markdown_text = to_markdown(pdf_document, pages=[page_num])
-            page_texts.append((page_num + 1, markdown_text))  # ページ番号とテキストをタプルで保存
+            page = pdf_document[page_num]
+            # 画像内の文字列を含めないテキストを取得
+            text = page.get_text("text")
+            # テキストの前処理を適用
+            text = preprocess_text(text)
+            page_texts.append((page_num + 1, text))
             # ページの処理時間を計測終了
             page_end_time = time.time()
             processing_time = page_end_time - page_start_time
             # ページごとの処理時間を保存
             page_processing_times.append({'ページ番号': page_num + 1, '処理時間（秒）': processing_time})
-            st.write(f"ページ {page_num + 1} のテキスト抽出にかかった時間: {processing_time:.2f} 秒")
         except Exception as e:
             st.write(f"ページ {page_num + 1} の処理中にエラーが発生しました: {e}")
             page_texts.append((page_num + 1, ""))  # 空のテキストを追加して処理を続行
@@ -125,14 +133,6 @@ def split_text_into_chunks_by_page(page_texts, chunk_size=2000, chunk_overlap=20
             page_chunks.append((page_num, chunk_text))  # ページ番号とチャンクを対応させる
     
     return page_chunks
-
-# チャンクが意図通り分割されているか確認するデバッグ表示
-def display_chunks_debug(page_chunks):
-    st.subheader("チャンク内容のデバッグ表示（ページごと）")
-    for page_num, chunk_text in page_chunks:
-        st.write(f"ページ {page_num} の内容:")
-        st.write(chunk_text[:100] + "...")  # 最初の100文字を表示
-        st.write("---")
 
 # チェック結果をパースしてDataFrameに変換する関数
 def parse_json_results_to_dataframe(results, page_num):
@@ -183,23 +183,41 @@ def count_total_sentences(page_texts):
 
 # エラーをGPT-4oを用いて比較する関数
 def compare_errors_with_gpt(ai_error, error_list_error):
-    prompt = f"""
-以下の2つのエラー情報が、同じ誤りを指摘しているかどうかを判断してください。
+    prompt = f'''
+以下の2つのエラー情報が、同じ誤りを指摘しているかを判断してください。
 
-AIの指摘:
-- ページ番号: {ai_error['ページ番号']}
-- 指摘箇所: {ai_error['指摘箇所']}
-- 指摘理由: {ai_error['指摘理由']}
-- 周辺テキスト: {ai_error['周辺テキスト']}
+**判断基準：**
 
-エラーリストの誤記:
-- ページ番号: {error_list_error['ページ']}
-- 誤記内容: {error_list_error['誤記内容']}
-- 正しい内容: {error_list_error['正しい内容']}
-- 補足: {error_list_error.get('補足', '')}
+- **エラーの種類が同じであること：** 例）誤字同士、文法エラー同士など
+- **指摘箇所が同一または非常に近いこと：** テキスト内での位置が近接している
+- **誤記内容と指摘箇所が一致すること：** 誤記の内容とAIの指摘内容が同じ
 
-これらのエラーは同じ誤りを指摘していますか？「はい」または「いいえ」で答えてください。
-"""
+**注意事項：**
+
+- 判断に迷う場合や確信が持てない場合は「いいえ」と答えてください。
+- 回答は「はい」または「いいえ」のみとし、理由や追加の情報は含めないでください。
+
+---
+
+**AIの指摘：**
+
+- **ページ番号：** {ai_error['ページ番号']}
+- **カテゴリ：** {ai_error['カテゴリ']}
+- **指摘箇所：** {ai_error['指摘箇所']}
+- **指摘理由：** {ai_error['指摘理由']}
+- **周辺テキスト：** {ai_error['周辺テキスト']}
+
+**誤記リストのエラー：**
+
+- **ページ番号：** {error_list_error['ページ']}
+- **誤記内容：** {error_list_error['誤記内容']}
+- **正しい内容：** {error_list_error['正しい内容']}
+- **補足：** {error_list_error.get('補足', '')}
+
+---
+
+以上の情報に基づいて、これらのエラーは同じ誤りを指摘していますか？「はい」または「いいえ」で答えてください。
+'''
     session_message = [{"role": "user", "content": prompt}]
 
     # チャット履歴に追加
@@ -208,16 +226,16 @@ AIの指摘:
     for attempt in range(3):  # 最大3回リトライ
         try:
             response = client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-4o",
                 seed=42,
-                temperature=0,
-                max_tokens=10,
+                temperature=0.1,
+                max_tokens=2,
                 messages=session_message
             )
             answer = response.choices[0].message.content.strip()
             # チャット履歴にAIの応答を追加
             chat_history[-1]["comparison"]["response"] = answer
-            if "はい" in answer:
+            if answer == "はい":
                 return True
             else:
                 return False
@@ -253,18 +271,28 @@ if uploaded_file is not None:
 
     # PDFからテキストをページごとに抽出
     doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-    page_texts = extract_text_with_pymupdf4llm(doc)
+    page_texts = extract_text_without_images(doc)
+
+    # 読み込んだページ数を表示
+    num_pages = len(page_texts)
+    st.write(f"読み込んだページ数: {num_pages}")
 
     # チャンクに分割
     page_chunks = split_text_into_chunks_by_page(page_texts)
 
-    # デバッグ: チャンクが意図通り分割されているか確認
-    display_chunks_debug(page_chunks)
+    # チャンク分割数を表示
+    num_chunks = len(page_chunks)
+    st.write(f"チャンク分割数: {num_chunks}")
+
+    # チェック進捗状況の表示
+    st.subheader("チェック進捗状況")
+    check_progress_bar = st.progress(0)
+    check_status_text = st.empty()
 
     # 各チャンクごとにAzure OpenAIでテキストチェック
     all_df_results = pd.DataFrame()
     for i, (page_num, chunk_text) in enumerate(page_chunks):
-        st.write(f"ページ {page_num} のチャンクをチェックしています...")
+        check_status_text.write(f"ページ {page_num} のチャンク {i+1}/{num_chunks} をチェックしています...")
 
         # チャンクが空でないことを確認
         if chunk_text.strip():
@@ -276,12 +304,18 @@ if uploaded_file is not None:
 
             chunk_end_time = time.time()  # チャンクの処理時間計測終了
             chunk_processing_time = chunk_end_time - chunk_start_time
-            st.write(f"ページ {page_num} のチャンク処理にかかった時間: {chunk_processing_time:.2f} 秒")
         else:
             st.write(f"ページ {page_num} のチャンクは空なのでスキップされました。")
 
+        # プログレスバーの更新
+        check_progress = (i + 1) / num_chunks
+        check_progress_bar.progress(check_progress)
+
         # リクエスト間に待機時間を追加
         time.sleep(1)  # 1秒待機
+
+    # チェック進捗状況の完了表示
+    check_status_text.write("チェックが完了しました。")
 
     # 全体の処理時間を計測終了
     total_end_time = time.time()
@@ -401,6 +435,13 @@ if uploaded_file is not None:
         matched_ai_errors = set()
         matched_error_list_errors = set()
 
+        # 精度評価進捗状況の表示
+        st.subheader("精度評価進捗状況")
+        evaluation_progress_bar = st.progress(0)
+        evaluation_status_text = st.empty()
+        total_comparisons = sum(len(all_df_results[all_df_results['ページ番号'] == page_num]) * len(error_df[error_df['ページ'] == page_num]) for page_num in all_pages)
+        comparisons_done = 0
+
         # 各ページごとにエラーを比較
         for page_num in all_pages:
             ai_errors_on_page = all_df_results[all_df_results['ページ番号'] == page_num]
@@ -420,6 +461,13 @@ if uploaded_file is not None:
                         matched = True
                         break  # マッチしたら次のAIエラーへ
                     time.sleep(1)  # 1秒待機
+
+                    # 進捗状況の更新
+                    comparisons_done += 1
+                    evaluation_progress = comparisons_done / total_comparisons
+                    evaluation_progress_bar.progress(evaluation_progress)
+                    evaluation_status_text.write(f"精度評価中... ({comparisons_done}/{total_comparisons})")
+
                 if not matched:
                     FP += 1  # マッチしなかったAIの指摘はFP
 
@@ -427,6 +475,9 @@ if uploaded_file is not None:
             for idx_el, error_list_error in error_list_errors_on_page.iterrows():
                 if idx_el not in matched_error_list_errors:
                     FN += 1
+
+        # 精度評価進捗状況の完了表示
+        evaluation_status_text.write("精度評価が完了しました。")
 
         # 総文数のカウント
         total_sentences = count_total_sentences(page_texts)
@@ -444,6 +495,20 @@ if uploaded_file is not None:
         st.write(f"FN（見逃されたエラーの数）: {FN}")
         st.write(f"TN（正しくエラーなしと判定された正しい部分の数）: {TN}")
 
+        # 精度評価のサマリを表示
+        st.write("精度評価のサマリ:")
+        precision = TP / (TP + FP) if (TP + FP) > 0 else 0
+        recall = TP / (TP + FN) if (TP + FN) > 0 else 0
+        f1_score = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+        st.write(f"適合率（Precision）: {precision:.2f}")
+        st.write(f"再現率（Recall）: {recall:.2f}")
+        st.write(f"F1スコア: {f1_score:.2f}")
+
+        # 誤記リストにはないが、AIが指摘した項目の一覧（FP）
+        false_positives = all_df_results.loc[~all_df_results.index.isin(matched_ai_errors)]
+        # 誤記リストにあるが、AIが指摘しなかった項目の一覧（FN）
+        false_negatives = error_df.loc[~error_df.index.isin(matched_error_list_errors)]
+
         # 精度評価結果をExcelに保存してセッション状態に保存
         evaluation_output = BytesIO()
         with pd.ExcelWriter(evaluation_output, engine='xlsxwriter') as writer:
@@ -460,6 +525,12 @@ if uploaded_file is not None:
 
             matched_error_list_df = error_df.loc[list(matched_error_list_errors)]
             matched_error_list_df.to_excel(writer, sheet_name='マッチした誤記リスト', index=False)
+
+            # False Positives（AIが指摘したが誤記リストにない）
+            false_positives.to_excel(writer, sheet_name='False Positives', index=False)
+
+            # False Negatives（誤記リストにあるがAIが指摘しなかった）
+            false_negatives.to_excel(writer, sheet_name='False Negatives', index=False)
 
             # ページ処理時間を保存
             page_times_df.to_excel(writer, sheet_name='ページ処理時間', index=False)
@@ -481,3 +552,6 @@ if uploaded_file is not None:
 
     else:
         st.write("エラー一覧ファイルがアップロードされていません。精度評価を行うには、エラー一覧ファイルをアップロードしてください。")
+
+else:
+    st.write("PDFファイルをアップロードしてください。")
