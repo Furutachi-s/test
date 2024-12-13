@@ -21,31 +21,30 @@ def check_text_with_openai(text):
     
     # ユーザーのプロンプトを作成
     prompt = f"""
-    以下の文章は建設機械のマニュアルです。
-    編集過程のため、内容に誤りが含まれている可能性があります。
+    あなたには建設機械のマニュアルをチェックしてもらいます。
     以下の項目についてチェックし、指摘してください: 
     (1) 誤字
     (2) 文脈的に、記載内容が明確に間違っている場合
     (3) 文法が致命的に間違っていて、文章として意味が通らない場合
-    (4) 周辺の記載内容と比較して、意図した内容になっていないと考えられる場合
 
-    重要なポイント
-    ・偽陽性を避けるため、判断に迷った場合は指摘しないでください。
+    ただし、以下の項目については指摘しないこと:
+    (1) 偽陽性を避けるため、判断に迷った場合は指摘しない
+    (2) 不自然な空白、半角スペースはPDF抽出時の仕様のため、指摘しない
+
+    回答形式:
     ・各指摘については、以下の形式でJSONとして返し、JSON以外の文字列を一切含めないでください。コードブロックや追加の説明も含めないでください。
     - "page": 該当ページ番号
+    - "category": 指摘のカテゴリ（例: 誤字、文法、文脈）
+    - "reason": 指摘した理由（簡潔に記述）
     - "error_location": 指摘箇所
-    - "reason": 指摘理由
     - "context": 周辺テキスト
-
-    以下の文章についてチェックを行ってください：
-    \n\n{text}
     """
     
     session_message.append({"role": "user", "content": prompt})
 
     # Azure OpenAIにリクエストを送信
     response = client.chat.completions.create(
-        model="gpt-4o",  # 使用するモデル
+        model="gpt-4o-mini",  # 使用するモデル
         seed=42,
         temperature=0,
         max_tokens=4000,  # トークン数を調整
@@ -99,7 +98,7 @@ def combine_pages_for_chunking(pdf_document, max_chars_per_chunk=10000, chunk_si
     st.write(f"{len(text_chunks)} 個のチャンクに分割されました（最大文字数: {chunk_size}）。")
     return text_chunks
 
-# 結果をパースしてDataFrameに変換する関数
+# 結果をパースしてDataFrameに変換する関数 (修正済み)
 def parse_json_results_to_dataframe(results, pages):
     issues = []
     
@@ -107,7 +106,6 @@ def parse_json_results_to_dataframe(results, pages):
     results = results.strip().strip("```").strip("json").strip()  # バッククオートや"json"ラベルを削除
     
     # カンマがある場合、それを削除してからパースする
-    # 改行後に } の前に , があれば削除
     results = results.replace(",\n}", "\n}")
 
     # JSON文字列を辞書にパース
@@ -125,16 +123,17 @@ def parse_json_results_to_dataframe(results, pages):
 
     # 各指摘結果をDataFrameに変換
     for error in errors_list:
-        issue = {
-            "ページ番号": ", ".join(map(str, pages)),
-            "指摘箇所": error.get("error_location", ""),
-            "指摘理由": error.get("reason", ""),
-            "周辺テキスト": error.get("context", "")
-        }
+        for page in pages:  # チャンクのページ番号ごとに処理
+            issue = {
+                "ページ番号": page,  # 各ページ番号ごとに記録
+                "指摘箇所": error.get("error_location", ""),
+                "指摘理由": error.get("reason", ""),
+                "周辺テキスト": error.get("context", "")
+            }
 
-        # データが空でない場合のみ追加
-        if issue["指摘箇所"] or issue["指摘理由"] or issue["周辺テキスト"]:
-            issues.append(issue)
+            # データが空でない場合のみ追加
+            if issue["指摘箇所"] or issue["指摘理由"] or issue["周辺テキスト"]:
+                issues.append(issue)
 
     # DataFrameに変換してから、空の行を削除
     df = pd.DataFrame(issues)

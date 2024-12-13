@@ -1,15 +1,15 @@
 import os
 import streamlit as st
-import fitz  # PyMuPDFとしてインポート
+import fitz  # PyMuPDF
 from openai import AzureOpenAI
 import pandas as pd
 from io import BytesIO
 import json
 import tiktoken
 import base64
-import time  # 処理時間計測のため追加
+import time
 import re
-import unicodedata  # テキスト正規化のため追加
+import unicodedata  # テキスト正規化のために追加
 
 # 環境変数からAPIキーとエンドポイントを取得
 key = os.getenv("AZURE_OPENAI_KEY")
@@ -32,29 +32,28 @@ def check_text_with_openai(text, page_num):
 
     prompt = f"""
 あなたには建設機械のマニュアルをチェックしてもらいます（該当ページ: {page_num}）。
+以下の項目についてチェックし、指摘してください: 
+(1) 誤字
+(2) 文脈的に、記載内容が明確に間違っている場合
+(3) 文法が致命的に間違っていて、文章として意味が通らない場合
 
-**指摘すべき項目**:
-1. 明らかな誤字・脱字
-2. 文法的に誤っており、意味が通じない文章
-3. 文脈上、明らかに間違っている内容
-
-**指摘しない項目**:
-1. PDF抽出時の不自然な改行やスペース
-2. 表や図のレイアウトによる文字のズレ
-3. カタカナ語の末尾に関する特例について:
-   - 英語の語尾 "-er"、"-or"、"-ar"、"-y" に相当するカタカナ語は、基本的に長音符号「ー」を用いて表記します。
+ただし、以下の項目については指摘しないでください:
+(1) 偽陽性を避けるため、判断に迷った場合は指摘しない
+(2) 不自然な空白、半角スペースはPDF抽出時の仕様のため、指摘しない
+(3) カタカナ語の末尾に関する特例について:
+   - 英語の語尾 "-er"、"-or"、"-ar"、"-y" に相当するカタカナ語は、基本的に長音符号「ー」を用いて表記しています。
+   - **例：** カバー（OK）、エアー（OK）
    - ただし、長音符号を除いた音節数が3以上の場合、最後の長音符号を省略することがあります。この場合、指摘は不要です。
    - **例：** バッテリ（OK）、スクリュ（OK）
 
-**重要な注意事項**:
-- 判断に迷う場合や不確かな場合は指摘しないでください。
-- 出力は以下のJSON形式で返してください。追加の説明やテキストは含めないでください。
-- 各指摘には以下の情報を含めてください：
-  - "page": 該当ページ番号
-  - "category": 指摘のカテゴリ（例: "誤字", "文法エラー", "文脈エラー"）
-  - "reason": 指摘した理由を簡潔に記述
-  - "error_location": 指摘箇所（具体的な単語やフレーズ）
-  - "context": 周辺のテキスト
+重要なポイント
+・偽陽性を避けるため、判断に迷った場合は指摘しないでください。
+・各指摘については、以下の形式でJSONとして返し、JSON以外の文字列を一切含めないでください。コードブロックや追加の説明も含めないでください。
+- "page": 該当ページ番号
+- "category": 指摘のカテゴリ（例: 誤字、文法、文脈）
+- "reason": 指摘した理由（簡潔に記述）
+- "error_location": 指摘箇所
+- "context": 周辺テキスト
 
 以下の文章についてチェックを行ってください：
 
@@ -65,12 +64,14 @@ def check_text_with_openai(text, page_num):
     # チャット履歴に追加
     chat_history.append({"page_num": page_num, "messages": session_message})
 
+    e = None  # eを初期化
+
     for attempt in range(3):  # 最大3回リトライ
         try:
             response = client.chat.completions.create(
                 model="gpt-4o",
                 seed=42,
-                temperature=0.1,
+                temperature=0,
                 max_tokens=2000,
                 messages=session_message
             )
@@ -82,39 +83,65 @@ def check_text_with_openai(text, page_num):
             time.sleep(5)
     st.write("エラーが続いたため、このチャンクをスキップします。")
     # チャット履歴にエラー情報を追加
-    chat_history[-1]["response"] = f"エラー: {e}"
+    if e is not None:
+        chat_history[-1]["response"] = f"エラー: {e}"
+    else:
+        chat_history[-1]["response"] = "不明なエラーが発生しました。"
     return ""
 
 # テキスト前処理関数
 def preprocess_text(text):
     # Unicode正規化
     text = unicodedata.normalize('NFKC', text)
-    # 不要な改行とスペースを削除
-    text = re.sub(r'\s+', ' ', text)
+    # 不要なスペースを削除（ただし改行は維持）
+    text = re.sub(r'[ \t]+', ' ', text)
     return text.strip()
 
-# 画像内の文字列を除外してPDFを解析し、ページごとにテキストを抽出する関数
-def extract_text_without_images(pdf_document):
+# 矩形の重なりを判定する関数
+def rects_overlap(rect1, rect2):
+    # rect: [x0, y0, x1, y1]
+    x0_1, y0_1, x1_1, y1_1 = rect1
+    x0_2, y0_2, x1_2, y1_2 = rect2
+    # 矩形が重なっていない場合
+    if x1_1 <= x0_2 or x1_2 <= x0_1 or y1_1 <= y0_2 or y1_2 <= y0_1:
+        return False
+    else:
+        return True
+
+# イラスト内のテキストを除外してテキストを抽出する関数
+def extract_text_excluding_images(pdf_document):
     page_texts = []
     for page_num in range(len(pdf_document)):
         try:
-            # ページの処理時間を計測開始
             page_start_time = time.time()
             page = pdf_document[page_num]
-            # 画像内の文字列を含めないテキストを取得
-            text = page.get_text("text")
+            # ページのブロック情報を取得
+            blocks = page.get_text("dict")["blocks"]
+            # 画像ブロックのbboxリストを作成
+            image_bboxes = [block["bbox"] for block in blocks if block["type"] == 1]
+            text_content = ""
+            for block in blocks:
+                if block["type"] == 0:  # テキストブロックの場合
+                    block_bbox = block["bbox"]
+                    # テキストブロックが画像ブロックと重なっているかをチェック
+                    overlaps = any(rects_overlap(block_bbox, image_bbox) for image_bbox in image_bboxes)
+                    if not overlaps:
+                        # 重なっていない場合、テキストを追加
+                        for line in block["lines"]:
+                            line_text = ""
+                            for span in line["spans"]:
+                                line_text += span["text"]
+                            text_content += line_text + "\n"
+                        text_content += "\n"
             # テキストの前処理を適用
-            text = preprocess_text(text)
-            page_texts.append((page_num + 1, text))
-            # ページの処理時間を計測終了
+            text_content = preprocess_text(text_content)
+            page_texts.append((page_num + 1, text_content))
             page_end_time = time.time()
             processing_time = page_end_time - page_start_time
-            # ページごとの処理時間を保存
             page_processing_times.append({'ページ番号': page_num + 1, '処理時間（秒）': processing_time})
         except Exception as e:
             st.write(f"ページ {page_num + 1} の処理中にエラーが発生しました: {e}")
-            page_texts.append((page_num + 1, ""))  # 空のテキストを追加して処理を続行
-            # エラーが発生した場合も処理時間を記録
+            page_texts.append((page_num + 1, ""))
             page_end_time = time.time()
             processing_time = page_end_time - page_start_time
             page_processing_times.append({'ページ番号': page_num + 1, '処理時間（秒）': processing_time})
@@ -122,7 +149,7 @@ def extract_text_without_images(pdf_document):
 
 # テキストをトークン数に基づいてチャンクに分割する関数
 def split_text_into_chunks_by_page(page_texts, chunk_size=2000, chunk_overlap=200):
-    encoding = tiktoken.encoding_for_model('gpt-4')
+    encoding = tiktoken.encoding_for_model('gpt-4o')
     page_chunks = []
     
     for page_num, text in page_texts:
@@ -223,12 +250,14 @@ def compare_errors_with_gpt(ai_error, error_list_error):
     # チャット履歴に追加
     chat_history.append({"comparison": {"ai_error": ai_error, "error_list_error": error_list_error, "prompt": prompt}})
 
+    e = None  # eを初期化
+
     for attempt in range(3):  # 最大3回リトライ
         try:
             response = client.chat.completions.create(
                 model="gpt-4o",
                 seed=42,
-                temperature=0.1,
+                temperature=0,
                 max_tokens=2,
                 messages=session_message
             )
@@ -243,8 +272,10 @@ def compare_errors_with_gpt(ai_error, error_list_error):
             st.write(f"エラーが発生しました（エラー比較中）。再試行します... ({e})")
             time.sleep(5)
     st.write("エラーが続いたため、この比較をスキップします。")
-    # チャット履歴にエラー情報を追加
-    chat_history[-1]["comparison"]["response"] = f"エラー: {e}"
+    if e is not None:
+        chat_history[-1]["comparison"]["response"] = f"エラー: {e}"
+    else:
+        chat_history[-1]["comparison"]["response"] = "不明なエラーが発生しました。"
     return False
 
 # ダウンロード用のデータをセッション状態で保持するための初期化
@@ -269,9 +300,9 @@ if uploaded_file is not None:
     # PDF全体の処理時間を計測開始
     total_start_time = time.time()
 
-    # PDFからテキストをページごとに抽出
+    # PDFからテキストをページごとに抽出（イラスト内のテキストを除外）
     doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-    page_texts = extract_text_without_images(doc)
+    page_texts = extract_text_excluding_images(doc)
 
     # 読み込んだページ数を表示
     num_pages = len(page_texts)
@@ -352,60 +383,10 @@ if uploaded_file is not None:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-    # チャット履歴と評価結果をExcelファイルに保存してセッション状態に保存
-    chat_output = BytesIO()
-    with pd.ExcelWriter(chat_output, engine='xlsxwriter') as writer:
-        # チャット履歴をDataFrameに変換
-        chat_df_list = []
-        for chat in chat_history:
-            if 'messages' in chat:
-                page_num = chat['page_num']
-                user_message = chat['messages'][1]['content']
-                assistant_response = chat.get('response', '')
-                chat_df_list.append({
-                    'ページ番号': page_num,
-                    'ユーザーの入力': user_message,
-                    'AIの応答': assistant_response
-                })
-            elif 'comparison' in chat:
-                comparison = chat['comparison']
-                ai_error = comparison['ai_error']
-                error_list_error = comparison['error_list_error']
-                prompt = comparison['prompt']
-                response = comparison.get('response', '')
-                chat_df_list.append({
-                    '比較': 'エラー比較',
-                    'AIの指摘': json.dumps(ai_error, ensure_ascii=False),
-                    'エラーリストの誤記': json.dumps(error_list_error.to_dict(), ensure_ascii=False),
-                    'プロンプト': prompt,
-                    'AIの応答': response
-                })
-        chat_df = pd.DataFrame(chat_df_list)
-        chat_df.to_excel(writer, sheet_name='チャット履歴', index=False)
-
-        # AIのチェック結果を保存
-        all_df_results.to_excel(writer, sheet_name='AIのチェック結果', index=False)
-
-        # ページ処理時間を保存
-        page_times_df.to_excel(writer, sheet_name='ページ処理時間', index=False)
-
-        # 合計処理時間を保存
-        summary_df.to_excel(writer, sheet_name='合計処理時間', index=False)
-
-    chat_output.seek(0)
-    chat_data = chat_output.getvalue()
-    st.session_state['chat_data'] = chat_data  # セッション状態に保存
-
-    # ダウンロードオプション
-    st.download_button(
-        label="チャット履歴と評価結果をダウンロード",
-        data=st.session_state['chat_data'],
-        file_name="チャット履歴と評価結果.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-
     # エラー一覧ファイルがアップロードされている場合、精度評価を行う
     if error_list_file is not None:
+        st.write("エラー一覧ファイルがアップロードされました。精度評価を開始します。")
+
         # エラー一覧ファイルを読み込む
         if error_list_file.name.endswith('.csv'):
             try:
@@ -464,7 +445,7 @@ if uploaded_file is not None:
 
                     # 進捗状況の更新
                     comparisons_done += 1
-                    evaluation_progress = comparisons_done / total_comparisons
+                    evaluation_progress = comparisons_done / total_comparisons if total_comparisons > 0 else 1
                     evaluation_progress_bar.progress(evaluation_progress)
                     evaluation_status_text.write(f"精度評価中... ({comparisons_done}/{total_comparisons})")
 
