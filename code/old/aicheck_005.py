@@ -6,10 +6,9 @@ import pandas as pd
 from io import BytesIO
 import json
 import tiktoken
-import base64
 import time
 import re
-import unicodedata  # テキスト正規化のために追加
+import unicodedata
 
 # 環境変数からAPIキーとエンドポイントを取得
 key = os.getenv("AZURE_OPENAI_KEY")
@@ -24,6 +23,12 @@ chat_history = []
 # ページごとの処理時間を保存するリスト
 page_processing_times = []
 
+# 抽出したテキストを保存するリスト
+extracted_texts = []
+
+# チャットログを保存するリスト
+chat_logs = []
+
 # チャット形式でOpenAIに問い合わせる関数
 def check_text_with_openai(text, page_num):
     session_message = []
@@ -33,27 +38,23 @@ def check_text_with_openai(text, page_num):
     prompt = f"""
 あなたには建設機械のマニュアルをチェックしてもらいます（該当ページ: {page_num}）。
 以下の項目についてチェックし、指摘してください: 
-(1) 誤字
-(2) 文脈的に、記載内容が明確に間違っている場合
-(3) 文法が致命的に間違っていて、文章として意味が通らない場合
+(1) 誤字、脱字
+(2) 文脈的に記載内容が間違っていてると考えられる場合
+(3) 文法が間違っていて、読者に意図しない誤解を与える場合
 
 ただし、以下の項目については指摘しないでください:
-(1) 偽陽性を避けるため、判断に迷った場合は指摘しない
-(2) 不自然な空白、半角スペースはPDF抽出時の仕様のため、指摘しない
-(3) カタカナ語の末尾に関する特例について:
-   - 英語の語尾 "-er"、"-or"、"-ar"、"-y" に相当するカタカナ語は、基本的に長音符号「ー」を用いて表記しています。
-   - **例：** カバー（OK）、エアー（OK）
-   - ただし、長音符号を除いた音節数が3以上の場合、最後の長音符号を省略することがあります。この場合、指摘は不要です。
-   - **例：** バッテリ（OK）、スクリュ（OK）
+(1) 不自然な改行や空白については、指摘しない
+(2) カタカナ単語の最後の長音符については基本的に省略することが正しいので指摘しない。例：バッテリ、モータ
 
 重要なポイント
-・偽陽性を避けるため、判断に迷った場合は指摘しないでください。
-・各指摘については、以下の形式でJSONとして返し、JSON以外の文字列を一切含めないでください。コードブロックや追加の説明も含めないでください。
+・各指摘については、以下の形式で**純粋なJSONのみを返し、コードブロックや追加の説明を一切含めないでください**。
 - "page": 該当ページ番号
 - "category": 指摘のカテゴリ（例: 誤字、文法、文脈）
 - "reason": 指摘した理由（簡潔に記述）
 - "error_location": 指摘箇所
 - "context": 周辺テキスト
+- "importance": 指摘の重要度（1から5の整数で評価、5が最も重要）
+- "confidence": 指摘根拠への自信度（1から5の整数で評価、5が最も自信がある）
 
 以下の文章についてチェックを行ってください：
 
@@ -61,8 +62,11 @@ def check_text_with_openai(text, page_num):
 """
     session_message.append({"role": "user", "content": prompt})
 
-    # チャット履歴に追加
-    chat_history.append({"page_num": page_num, "messages": session_message})
+    # チャットログに追加
+    chat_logs.append({
+        "page_num": page_num,
+        "messages": session_message.copy()  # メッセージのコピーを保存
+    })
 
     e = None  # eを初期化
 
@@ -76,7 +80,13 @@ def check_text_with_openai(text, page_num):
                 messages=session_message
             )
             # チャット履歴にAIの応答を追加
-            chat_history[-1]["response"] = response.choices[0].message.content
+            chat_history.append({
+                "page_num": page_num,
+                "messages": session_message,
+                "response": response.choices[0].message.content
+            })
+            # チャットログにAIの応答を追加
+            chat_logs[-1]["response"] = response.choices[0].message.content
             return response.choices[0].message.content
         except Exception as e:
             st.write(f"エラーが発生しました。再試行します... ({e})")
@@ -84,15 +94,28 @@ def check_text_with_openai(text, page_num):
     st.write("エラーが続いたため、このチャンクをスキップします。")
     # チャット履歴にエラー情報を追加
     if e is not None:
-        chat_history[-1]["response"] = f"エラー: {e}"
+        chat_history.append({
+            "page_num": page_num,
+            "messages": session_message,
+            "response": f"エラー: {e}"
+        })
+        # チャットログにもエラー情報を追加
+        chat_logs[-1]["response"] = f"エラー: {e}"
     else:
-        chat_history[-1]["response"] = "不明なエラーが発生しました。"
+        chat_history.append({
+            "page_num": page_num,
+            "messages": session_message,
+            "response": "不明なエラーが発生しました。"
+        })
+        chat_logs[-1]["response"] = "不明なエラーが発生しました。"
     return ""
 
 # テキスト前処理関数
 def preprocess_text(text):
     # Unicode正規化
     text = unicodedata.normalize('NFKC', text)
+    # 制御文字を除去（改行とタブは除く）
+    text = ''.join(ch for ch in text if unicodedata.category(ch)[0] != 'C' or ch in ['\n', '\t'])
     # 不要なスペースを削除（ただし改行は維持）
     text = re.sub(r'[ \t]+', ' ', text)
     return text.strip()
@@ -108,13 +131,28 @@ def rects_overlap(rect1, rect2):
     else:
         return True
 
-# イラスト内のテキストを除外してテキストを抽出する関数
-def extract_text_excluding_images(pdf_document):
+# ヘッダーとフッター領域に含まれるかを判定する関数
+def is_in_header_footer(block_bbox, page_height, header_height, footer_height):
+    x0, y0, x1, y1 = block_bbox
+    # ヘッダー領域
+    if y0 <= header_height:
+        return True
+    # フッター領域
+    if y1 >= page_height - footer_height:
+        return True
+    return False
+
+# イラスト内のテキストとヘッダー・フッターを除外してテキストを抽出する関数
+def extract_text_excluding_images_and_header_footer(pdf_document):
     page_texts = []
     for page_num in range(len(pdf_document)):
         try:
             page_start_time = time.time()
             page = pdf_document[page_num]
+            page_height = page.rect.height
+            # ヘッダーとフッターの高さ（ページ高さの15%に調整）
+            header_height = page_height * 0.05
+            footer_height = page_height * 0.05
             # ページのブロック情報を取得
             blocks = page.get_text("dict")["blocks"]
             # 画像ブロックのbboxリストを作成
@@ -124,8 +162,10 @@ def extract_text_excluding_images(pdf_document):
                 if block["type"] == 0:  # テキストブロックの場合
                     block_bbox = block["bbox"]
                     # テキストブロックが画像ブロックと重なっているかをチェック
-                    overlaps = any(rects_overlap(block_bbox, image_bbox) for image_bbox in image_bboxes)
-                    if not overlaps:
+                    overlaps_image = any(rects_overlap(block_bbox, image_bbox) for image_bbox in image_bboxes)
+                    # テキストブロックがヘッダー・フッターに含まれるかをチェック
+                    in_header_footer = is_in_header_footer(block_bbox, page_height, header_height, footer_height)
+                    if not overlaps_image and not in_header_footer:
                         # 重なっていない場合、テキストを追加
                         for line in block["lines"]:
                             line_text = ""
@@ -139,12 +179,21 @@ def extract_text_excluding_images(pdf_document):
             page_end_time = time.time()
             processing_time = page_end_time - page_start_time
             page_processing_times.append({'ページ番号': page_num + 1, '処理時間（秒）': processing_time})
+            # 抽出したテキストを保存
+            extracted_texts.append({
+                'ページ番号': page_num + 1,
+                'テキスト': text_content
+            })
         except Exception as e:
             st.write(f"ページ {page_num + 1} の処理中にエラーが発生しました: {e}")
             page_texts.append((page_num + 1, ""))
             page_end_time = time.time()
             processing_time = page_end_time - page_start_time
             page_processing_times.append({'ページ番号': page_num + 1, '処理時間（秒）': processing_time})
+            extracted_texts.append({
+                'ページ番号': page_num + 1,
+                'テキスト': ""
+            })
     return page_texts
 
 # テキストをトークン数に基づいてチャンクに分割する関数
@@ -163,12 +212,26 @@ def split_text_into_chunks_by_page(page_texts, chunk_size=2000, chunk_overlap=20
 
 # チェック結果をパースしてDataFrameに変換する関数
 def parse_json_results_to_dataframe(results, page_num):
+    import re
     issues = []
-    results = results.strip().strip("```").strip("json").strip()
+    # 前後の不要な文字を削除
+    results = results.strip()
+    # コードブロックの除去
+    results = re.sub(r'^```(?:json)?', '', results)
+    results = re.sub(r'```$', '', results)
+    results = results.strip()
+    # JSON部分を抽出
+    match = re.search(r'(\{.*\}|\[.*\])', results, re.DOTALL)
+    if match:
+        json_str = match.group(0)
+    else:
+        json_str = results  # そのまま使用
     try:
-        json_results = json.loads(results)
+        json_results = json.loads(json_str)
     except json.JSONDecodeError as e:
-        st.write(f"JSONの解析に失敗しました: {e}")
+        st.write(f"ページ {page_num} のJSON解析に失敗しました: {e}")
+        st.write("返答内容:")
+        st.write(results)  # デバッグのために返答内容を表示
         return pd.DataFrame()
 
     if isinstance(json_results, list):
@@ -182,7 +245,9 @@ def parse_json_results_to_dataframe(results, page_num):
             "カテゴリ": error.get("category", ""),
             "指摘箇所": error.get("error_location", ""),
             "指摘理由": error.get("reason", ""),
-            "周辺テキスト": error.get("context", "")
+            "周辺テキスト": error.get("context", ""),
+            "重要度": error.get("importance", ""),
+            "自信度": error.get("confidence", "")
         }
 
         if issue["指摘箇所"] or issue["指摘理由"] or issue["周辺テキスト"]:
@@ -195,6 +260,138 @@ def parse_json_results_to_dataframe(results, page_num):
         df.dropna(how='all', inplace=True)
 
     return df
+
+# チェック結果をフィルタリングする関数を追加
+def filter_check_results_with_openai(df_results, chunk_size=5):
+    filtered_results_list = []
+    excluded_results_list = []
+    total_results = len(df_results)
+    num_chunks = (total_results // chunk_size) + (1 if total_results % chunk_size != 0 else 0)
+
+    for i in range(num_chunks):
+        start_idx = i * chunk_size
+        end_idx = min((i + 1) * chunk_size, total_results)
+        df_chunk = df_results.iloc[start_idx:end_idx]
+
+        # チャンクが空の場合はスキップ
+        if df_chunk.empty:
+            continue
+
+        session_message = []
+        system_prompt = "You are a helpful assistant."
+        session_message.append({"role": "system", "content": system_prompt})
+
+        # チャンクのチェック結果をJSON形式で文字列化
+        check_results_json = df_chunk.to_dict(orient='records')
+        check_results_str = json.dumps(check_results_json, ensure_ascii=False, indent=2)
+
+        prompt = f"""
+以下のチェック結果リストがあります。
+
+{check_results_str}
+
+あなたは以下の項目について、チェック結果を選別してください。以下の項目に該当するものは除外してください:
+
+(1) 不自然な改行や空白については、指摘しない
+(2) カタカナ単語の末尾の長音符の欠落については独自ルールがあるため指摘しない。例：バッテリ、モータ。ただし単語途中の長音符の欠落は指摘は除外しないでください。
+
+結果は以下の形式で**純粋なJSONのみを返し、コードブロックや追加の説明を一切含めないでください**。
+
+- "filtered_results": フィルタリングされたチェック結果のリスト
+- "excluded_results": 除外されたチェック結果のリスト
+"""
+        session_message.append({"role": "user", "content": prompt})
+
+        # チャットログに追加
+        chat_logs.append({
+            "filtering_chunk": i + 1,
+            "messages": session_message.copy()
+        })
+
+        e = None  # eを初期化
+
+        for attempt in range(3):  # 最大3回リトライ
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-4o",  # モデル名を確認（例: "gpt-4"）
+                    temperature=0,
+                    max_tokens=2000,
+                    messages=session_message
+                )
+                # チャット履歴にAIの応答を追加
+                chat_history.append({
+                    "filtering_chunk": i + 1,
+                    "messages": session_message,
+                    "response": response.choices[0].message.content
+                })
+                # チャットログにAIの応答を追加
+                chat_logs[-1]["response"] = response.choices[0].message.content
+
+                # レスポンスからJSONを解析
+                filtered_chunk, excluded_chunk = parse_filter_response(response.choices[0].message.content)
+
+                # リストに追加
+                filtered_results_list.extend(filtered_chunk)
+                excluded_results_list.extend(excluded_chunk)
+
+                break  # 成功したらループを抜ける
+            except Exception as e:
+                st.write(f"フィルタリング中にエラーが発生しました。再試行します... ({e})")
+                time.sleep(5)
+        else:
+            st.write("エラーが続いたため、このフィルタリングチャンクをスキップします。")
+            # チャット履歴にエラー情報を追加
+            if e is not None:
+                chat_history.append({
+                    "filtering_chunk": i + 1,
+                    "messages": session_message,
+                    "response": f"エラー: {e}"
+                })
+                chat_logs[-1]["response"] = f"エラー: {e}"
+            else:
+                chat_history.append({
+                    "filtering_chunk": i + 1,
+                    "messages": session_message,
+                    "response": "不明なエラーが発生しました。"
+                })
+                chat_logs[-1]["response"] = "不明なエラーが発生しました。"
+
+    # 最終的な結果をDataFrameに変換
+    filtered_results_df = pd.DataFrame(filtered_results_list)
+    excluded_results_df = pd.DataFrame(excluded_results_list)
+
+    return filtered_results_df, excluded_results_df
+
+def parse_filter_response(response_text):
+    import re
+
+    # レスポンスからJSON部分を抽出
+    response_text = response_text.strip()
+    # コードブロックの除去
+    response_text = re.sub(r'^```(?:json)?', '', response_text)
+    response_text = re.sub(r'```$', '', response_text)
+    response_text = response_text.strip()
+
+    # JSON部分を抽出
+    match = re.search(r'(\{.*\}|\[.*\])', response_text, re.DOTALL)
+    if match:
+        json_str = match.group(0)
+    else:
+        json_str = response_text  # そのまま使用
+
+    try:
+        json_data = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        st.write(f"フィルタリング結果のJSON解析に失敗しました: {e}")
+        st.write("フィルタリング返答内容:")
+        st.write(response_text)
+        return [], []
+
+    filtered_results = json_data.get('filtered_results', [])
+    excluded_results = json_data.get('excluded_results', [])
+
+    return filtered_results, excluded_results
+
 
 # 全体のテキストから総文数をカウントする関数
 def count_total_sentences(page_texts):
@@ -247,8 +444,14 @@ def compare_errors_with_gpt(ai_error, error_list_error):
 '''
     session_message = [{"role": "user", "content": prompt}]
 
-    # チャット履歴に追加
-    chat_history.append({"comparison": {"ai_error": ai_error, "error_list_error": error_list_error, "prompt": prompt}})
+    # チャットログに追加
+    chat_logs.append({
+        "comparison": {
+            "ai_error": ai_error,
+            "error_list_error": error_list_error,
+            "prompt": prompt
+        }
+    })
 
     e = None  # eを初期化
 
@@ -263,7 +466,16 @@ def compare_errors_with_gpt(ai_error, error_list_error):
             )
             answer = response.choices[0].message.content.strip()
             # チャット履歴にAIの応答を追加
-            chat_history[-1]["comparison"]["response"] = answer
+            chat_history.append({
+                "comparison": {
+                    "ai_error": ai_error,
+                    "error_list_error": error_list_error,
+                    "prompt": prompt,
+                    "response": answer
+                }
+            })
+            # チャットログにもAIの応答を追加
+            chat_logs[-1]["comparison"]["response"] = answer
             if answer == "はい":
                 return True
             else:
@@ -273,9 +485,25 @@ def compare_errors_with_gpt(ai_error, error_list_error):
             time.sleep(5)
     st.write("エラーが続いたため、この比較をスキップします。")
     if e is not None:
-        chat_history[-1]["comparison"]["response"] = f"エラー: {e}"
+        chat_history.append({
+            "comparison": {
+                "ai_error": ai_error,
+                "error_list_error": error_list_error,
+                "prompt": prompt,
+                "response": f"エラー: {e}"
+            }
+        })
+        chat_logs[-1]["comparison"]["response"] = f"エラー: {e}"
     else:
-        chat_history[-1]["comparison"]["response"] = "不明なエラーが発生しました。"
+        chat_history.append({
+            "comparison": {
+                "ai_error": ai_error,
+                "error_list_error": error_list_error,
+                "prompt": prompt,
+                "response": "不明なエラーが発生しました。"
+            }
+        })
+        chat_logs[-1]["comparison"]["response"] = "不明なエラーが発生しました。"
     return False
 
 # ダウンロード用のデータをセッション状態で保持するための初期化
@@ -300,9 +528,9 @@ if uploaded_file is not None:
     # PDF全体の処理時間を計測開始
     total_start_time = time.time()
 
-    # PDFからテキストをページごとに抽出（イラスト内のテキストを除外）
+    # PDFからテキストをページごとに抽出（イラスト内のテキストとヘッダー・フッターを除外）
     doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-    page_texts = extract_text_excluding_images(doc)
+    page_texts = extract_text_excluding_images_and_header_footer(doc)
 
     # 読み込んだページ数を表示
     num_pages = len(page_texts)
@@ -345,33 +573,47 @@ if uploaded_file is not None:
         # リクエスト間に待機時間を追加
         time.sleep(1)  # 1秒待機
 
-    # チェック進捗状況の完了表示
     check_status_text.write("チェックが完了しました。")
+
+    # チェック結果のフィルタリングを実行
+    st.subheader("チェック結果の再検証を実行しています...")
+
+    # フィルタリング処理を実行し、結果を取得
+    filtered_results_df, excluded_results_df = filter_check_results_with_openai(all_df_results)
+
+    # フィルタリング後のチェック結果を表示
+    if filtered_results_df.empty:
+        st.write("フィルタリング後のチェック結果が空です")
+    else:
+        st.dataframe(filtered_results_df)
 
     # 全体の処理時間を計測終了
     total_end_time = time.time()
     total_processing_time = total_end_time - total_start_time
     st.write(f"PDF全体の処理にかかった時間: {total_processing_time:.2f} 秒")
 
-    # ページごとの処理時間のDataFrameを作成
+    # ページごとの処理時間の DataFrame を作成
     page_times_df = pd.DataFrame(page_processing_times)
 
-    # チェック結果を表示（テーブル形式で見やすく）
-    st.subheader("AIによるチェック結果")
-
-    if all_df_results.empty:
-        st.write("チェック結果が空です")
-    else:
-        st.dataframe(all_df_results)
-
-    # データをExcelファイルに変換してセッション状態に保存
+    # データを Excel ファイルに変換してセッション状態に保存
     output = BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        all_df_results.to_excel(writer, sheet_name='チェック結果', index=False)
+        filtered_results_df.to_excel(writer, sheet_name='チェック結果', index=False)
         page_times_df.to_excel(writer, sheet_name='ページ処理時間', index=False)
         # 全体の処理時間を記録
         summary_df = pd.DataFrame({'合計処理時間（秒）': [total_processing_time]})
         summary_df.to_excel(writer, sheet_name='合計処理時間', index=False)
+        # 抽出したテキストを保存
+        extracted_texts_df = pd.DataFrame(extracted_texts)
+        extracted_texts_df.to_excel(writer, sheet_name='抽出テキスト', index=False)
+        # チャットログを保存
+        chat_logs_df = pd.DataFrame(chat_logs)
+        chat_logs_df.to_excel(writer, sheet_name='チャットログ', index=False)
+        # 除外された結果を保存
+        if not excluded_results_df.empty:
+            excluded_results_df.to_excel(writer, sheet_name='除外された指摘項目', index=False)
+
+    # ここから `with` ブロックの外側になります
     processed_data = output.getvalue()
     st.session_state['processed_data'] = processed_data  # セッション状態に保存
 
@@ -398,16 +640,20 @@ if uploaded_file is not None:
         else:
             st.write("サポートされていないファイル形式です。CSVまたはExcelファイルをアップロードしてください。")
 
+        # 除外された結果を精度評価から除外
+        if not excluded_results_df.empty:
+            filtered_results_df = filtered_results_df[~filtered_results_df.index.isin(excluded_results_df.index)]
+
         # データの前処理：文字列型に変換し、空白を削除
-        all_df_results['指摘箇所'] = all_df_results['指摘箇所'].astype(str).str.strip()
+        filtered_results_df['指摘箇所'] = filtered_results_df['指摘箇所'].astype(str).str.strip()
         error_df['誤記内容'] = error_df['誤記内容'].astype(str).str.strip()
 
         # ページ番号を整数型に変換
-        all_df_results['ページ番号'] = all_df_results['ページ番号'].astype(int)
+        filtered_results_df['ページ番号'] = filtered_results_df['ページ番号'].astype(int)
         error_df['ページ'] = error_df['ページ'].astype(int)
 
         # ページ番号のユニークなリストを取得
-        all_pages = set(all_df_results['ページ番号']).union(set(error_df['ページ']))
+        all_pages = set(filtered_results_df['ページ番号']).union(set(error_df['ページ']))
 
         TP = 0  # True Positives
         FP = 0  # False Positives
@@ -420,12 +666,16 @@ if uploaded_file is not None:
         st.subheader("精度評価進捗状況")
         evaluation_progress_bar = st.progress(0)
         evaluation_status_text = st.empty()
-        total_comparisons = sum(len(all_df_results[all_df_results['ページ番号'] == page_num]) * len(error_df[error_df['ページ'] == page_num]) for page_num in all_pages)
+        total_comparisons = sum(
+            len(filtered_results_df[filtered_results_df['ページ番号'] == page_num]) * 
+            len(error_df[error_df['ページ'] == page_num]) 
+            for page_num in all_pages
+        )
         comparisons_done = 0
 
         # 各ページごとにエラーを比較
         for page_num in all_pages:
-            ai_errors_on_page = all_df_results[all_df_results['ページ番号'] == page_num]
+            ai_errors_on_page = filtered_results_df[filtered_results_df['ページ番号'] == page_num]
             error_list_errors_on_page = error_df[error_df['ページ'] == page_num]
 
             # AIの指摘がある場合
@@ -486,7 +736,7 @@ if uploaded_file is not None:
         st.write(f"F1スコア: {f1_score:.2f}")
 
         # 誤記リストにはないが、AIが指摘した項目の一覧（FP）
-        false_positives = all_df_results.loc[~all_df_results.index.isin(matched_ai_errors)]
+        false_positives = filtered_results_df.loc[~filtered_results_df.index.isin(matched_ai_errors)]
         # 誤記リストにあるが、AIが指摘しなかった項目の一覧（FN）
         false_negatives = error_df.loc[~error_df.index.isin(matched_error_list_errors)]
 
@@ -501,7 +751,7 @@ if uploaded_file is not None:
             evaluation_df.to_excel(writer, sheet_name='精度評価結果', index=False)
 
             # マッチしたエラーを保存
-            matched_ai_df = all_df_results.loc[list(matched_ai_errors)]
+            matched_ai_df = filtered_results_df.loc[list(matched_ai_errors)]
             matched_ai_df.to_excel(writer, sheet_name='マッチしたAIエラー', index=False)
 
             matched_error_list_df = error_df.loc[list(matched_error_list_errors)]
@@ -519,6 +769,16 @@ if uploaded_file is not None:
             # 合計処理時間を保存
             summary_df.to_excel(writer, sheet_name='合計処理時間', index=False)
 
+            # 抽出したテキストを保存
+            extracted_texts_df.to_excel(writer, sheet_name='抽出テキスト', index=False)
+
+            # チャットログを保存
+            chat_logs_df.to_excel(writer, sheet_name='チャットログ', index=False)
+
+            # 除外された結果を保存
+            if not excluded_results_df.empty:
+                excluded_results_df.to_excel(writer, sheet_name='除外された指摘項目', index=False)
+
         evaluation_output.seek(0)
         evaluation_data = evaluation_output.getvalue()
         st.session_state['evaluation_data'] = evaluation_data  # セッション状態に保存
@@ -534,5 +794,6 @@ if uploaded_file is not None:
     else:
         st.write("エラー一覧ファイルがアップロードされていません。精度評価を行うには、エラー一覧ファイルをアップロードしてください。")
 
+# アップロードされたPDFファイルがない場合のメッセージ
 else:
     st.write("PDFファイルをアップロードしてください。")
