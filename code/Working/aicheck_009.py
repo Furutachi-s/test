@@ -10,8 +10,9 @@ import time
 import re
 import unicodedata
 import asyncio
-import html
-import streamlit.components.v1 as components
+
+# ストリームリットのページ設定（ワイドモードを有効化）
+st.set_page_config(layout="wide") 
 
 # ===== 環境変数からAPIキーとエンドポイントを取得 =====
 key = os.getenv("AZURE_OPENAI_KEY")
@@ -23,8 +24,10 @@ if not key or not endpoint:
 # ===== Azure OpenAI クライアント初期化 =====
 client = AzureOpenAI(api_key=key, api_version="2023-12-01-preview", azure_endpoint=endpoint)
 
+# ログ用リストの初期化
 page_processing_times = []
 extracted_texts = []
+chat_logs = []
 
 def preprocess_text(text):
     """テキストの前処理を行います。"""
@@ -37,7 +40,7 @@ def rects_overlap(rect1, rect2):
     """2つの矩形が重なっているかを判定します。"""
     x0_1, y0_1, x1_1, y1_1 = rect1
     x0_2, y0_2, x1_2, y1_2 = rect2
-    if x1_1 <= x0_2 or x1_2 <= x0_1 or y1_1 <= y0_2:
+    if x1_1 <= x0_2 or x1_2 <= x0_1 or y1_1 <= y0_2 or y1_2 <= y0_1:
         return False
     return True
 
@@ -120,56 +123,34 @@ def split_text_into_chunks_by_page(page_texts, chunk_size=2000, chunk_overlap=20
 
 async def async_check_text_with_openai(client, text, page_num, semaphore):
     """非同期でOpenAI APIを呼び出してテキストをチェックします。"""
-    # プロンプト調整：  
-    # 必須修正対象がなければ無理に指摘をしないが、必要であれば参考情報を1～2件程度出しても良い。
-    # ただしほぼ問題がなければ空配列[]で返しても良い。
+    # プロンプトをシンプルで包括的なものに戻す（2つめに近い形）
     session_message = [
-        {"role": "system", "content": """あなたは建設機械マニュアルのチェックアシスタントです。
-以下のルールに従って、テキスト中の問題を指摘してください：
+        {"role": "system", "content": """あなたは建設機械マニュアルのチェックアシスタントです。以下の事項を確認し、問題点を指摘してください。
 
-【指摘してほしい問題点(必須修正)】
-(1) 明確な誤字・脱字
-(2) 明確な文法ミス
-(3) 文脈的な明確な誤り
-→ "info_type": "必須修正"
+【指摘してほしい問題点】
+(1) 誤字や脱字
+(2) 意味伝達に支障があるレベルの文法ミス
+(3) 文脈的に不適切、または誤った記載
 
 【指摘不要】
-- 不自然な改行・空白
-- カタカナ末尾長音省略
-- 画像・図版関連指摘
+- 不自然な改行・空白（PDF抽出由来の可能性が高い）
+- カタカナ用語の末尾長音の省略に関する指摘（例：バッテリ→バッテリー）
 
-【参考情報 (info_type=参考情報)】
-- 同一用語の表記揺れ統一提案
-- 改善余地あるが誤りではない表現提案
+【回答形式】  
+以下の形式で問題がある場合は列挙してください。  
+問題がなければ空の配列"[]"のみ出力してください。
 
-【追加条件】
-- 必須修正対象が一切ない場合、無理に指摘は不要。参考情報も特に思い当たらなければ空の配列"[]"のみ返すこと。
-- 必須修正対象が無くても、もし有意な改善提案（表記揺れ統一など）が実際に存在するなら、参考情報として1～2件程度まで指摘しても良い。
-- 出力は必ずJSON形式のみ(不要な説明文は出さない)。
-
-【出力形式】
 [
   {
     "page": <page_num>,
-    "category": "誤字"/"文法"/"文脈"/"参考情報",
-    "reason": "指摘理由",
+    "category": "誤字" or "文法" or "文脈",
+    "reason": "具体的な理由",
     "error_location": "指摘箇所",
-    "context": "周辺テキスト",
-    "suggestion": "修正案",
-    "importance": 1～5,
-    "confidence": 1～5,
-    "info_type": "必須修正"または"参考情報"
+    "suggestion": "修正案"
   }
 ]
-""" },
-        {"role": "user", "content": f"""
-以下は、PDF抽出テキストの一部です（該当ページ: {page_num}）。
-
-{text}
-
-このページのテキストをチェックし、上記ルールに基づき指摘してください。
-出力はJSON形式のみ。
-"""}
+"""},
+        {"role": "user", "content": f"以下は、PDF抽出テキストの一部です（該当ページ: {page_num}）。\n\n{text}" }
     ]
 
     async with semaphore:
@@ -179,16 +160,29 @@ async def async_check_text_with_openai(client, text, page_num, semaphore):
                 response = await asyncio.to_thread(
                     client.chat.completions.create,
                     model="gpt-4o",
-                    seed=42,
                     temperature=0,
                     max_tokens=2000,
                     messages=session_message
                 )
+                # チャットログに追加
+                chat_logs.append({
+                    "page_num": page_num,
+                    "messages": session_message,
+                    "response": response.choices[0].message.content
+                })
                 return (page_num, response.choices[0].message.content)
             except Exception as ex:
-                await asyncio.sleep(5)
-        st.warning(f"ページ {page_num} のチェックに失敗しました。")
-        return (page_num, "")
+                if attempt < 2:
+                    st.write(f"ページ {page_num} のチェック中にエラーが発生しました。再試行します... ({ex})")
+                    await asyncio.sleep(5)
+                else:
+                    st.warning(f"ページ {page_num} のチェックに失敗しました。")
+                    chat_logs.append({
+                        "page_num": page_num,
+                        "messages": session_message,
+                        "response": f"エラー: {ex}"
+                    })
+                    return (page_num, "")
 
 async def run_async_check(client, page_chunks, progress_bar, check_status_text):
     """非同期でテキストチェックを実行します。"""
@@ -234,6 +228,7 @@ def parse_json_results_to_dataframe(results, page_num):
     try:
         json_results = json.loads(results.strip())
     except json.JSONDecodeError:
+        st.write(f"ページ {page_num} のJSON解析に失敗しました。")
         return pd.DataFrame()
 
     if not isinstance(json_results, list):
@@ -246,11 +241,7 @@ def parse_json_results_to_dataframe(results, page_num):
             "カテゴリ": error.get("category", ""),
             "指摘箇所": error.get("error_location", ""),
             "指摘理由": error.get("reason", ""),
-            "修正案": error.get("suggestion", ""),
-            "周辺テキスト": error.get("context", ""),
-            "重要度": error.get("importance", ""),
-            "自信度": error.get("confidence", ""),
-            "情報種別": error.get("info_type", "")
+            "修正案": error.get("suggestion", "")
         }
         if any(val for val in issue.values()):
             issues.append(issue)
@@ -282,29 +273,40 @@ def parse_filter_response(response_text):
     return filtered_results, excluded_results
 
 async def async_filter_chunk_with_openai(client, df_chunk, chunk_index, semaphore):
-    """非同期でフィルタリングを実行します。"""
-    session_message = []
-    system_prompt = "You are a helpful assistant."
-    session_message.append({"role": "system", "content": system_prompt})
+    """非同期でフィルタリングチャンクをOpenAIに送信します。"""
+    # フィルタリングもシンプルな指示にする
+    system_prompt = """あなたはチェック結果を整理するフィルタリングアシスタントです。
+以下の方針で、チェック結果をふるい分けてください。
+
+【excluded_results に回す項目】  
+- 不自然な改行や空白のみの問題
+- カタカナ末尾長音有無の揺れのみ
+
+【filtered_results に残す項目】  
+- 上記以外の重要な誤字・文法・文脈ミス
+
+必ず以下形式のJSONのみを出力してください:
+{
+  "filtered_results": [...],
+  "excluded_results": [...]
+}
+"""
 
     check_results_json = df_chunk.to_dict(orient='records')
     check_results_str = json.dumps(check_results_json, ensure_ascii=False, indent=2)
 
-    prompt = f"""
-以下のチェック結果リストがあります。
+    user_prompt = f"""
+以下はチェック結果のリストです。
 
 {check_results_str}
 
-以下は除外：
-- 不自然な改行・空白
-- カタカナ末尾長音省略指摘
-- 画像・図版関連指摘
-
-JSONで:
-"filtered_results": 除外でない結果
-"excluded_results": 除外結果
+上記ルールに基づき、"filtered_results"と"excluded_results"に振り分けてください。
 """
-    session_message.append({"role": "user", "content": prompt})
+
+    session_message = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
 
     async with semaphore:
         await asyncio.sleep(0.5)  # レート制限対策
@@ -317,12 +319,25 @@ JSONで:
                     max_tokens=2000,
                     messages=session_message
                 )
+                chat_logs.append({
+                    "chunk_index": chunk_index,
+                    "messages": session_message,
+                    "response": response.choices[0].message.content
+                })
                 filtered_chunk, excluded_chunk = parse_filter_response(response.choices[0].message.content)
                 return filtered_chunk, excluded_chunk
             except Exception as ex:
-                await asyncio.sleep(5)
-        st.warning(f"フィルタリングチャンク {chunk_index} の処理に失敗しました。")
-        return [], []
+                if attempt < 2:
+                    st.write(f"フィルタリングチャンク {chunk_index} の処理中にエラーが発生しました。再試行します... ({ex})")
+                    await asyncio.sleep(5)
+                else:
+                    st.warning(f"フィルタリングチャンク {chunk_index} の処理に失敗しました。")
+                    chat_logs.append({
+                        "chunk_index": chunk_index,
+                        "messages": session_message,
+                        "response": f"エラー: {ex}"
+                    })
+                    return [], []
 
 async def run_async_filter(client, df_results, chunk_size, progress_bar):
     """非同期でフィルタリングを実行します。"""
@@ -387,21 +402,19 @@ def add_location_info(df, extracted_texts):
         if pd.isna(err_loc) or page_num not in page_map:
             continue
 
-        # 正規化と前後空白除去
         err_loc = unicodedata.normalize('NFKC', str(err_loc)).strip()
         full_text = unicodedata.normalize('NFKC', page_map[page_num]).strip()
 
         idx = full_text.find(err_loc)
 
         if idx == -1:
-            # 近似値検索: 単語で探す
+            # 近似検索: 単語で探す
             words = err_loc.split()
             candidates = [full_text.find(w) for w in words if w and full_text.find(w) != -1]
             if candidates:
                 idx = min(candidates)
 
         if idx == -1:
-            # 見つからない場合はスキップ
             continue
 
         line_number = full_text.count('\n', 0, idx) + 1
@@ -410,29 +423,32 @@ def add_location_info(df, extracted_texts):
 
     return df
 
-def copy_button(text, button_label="コピー", key=None):
-    """テキストをコピーするボタンを作成します。"""
-    escaped_text = html.escape(text.replace("'", "\\'"))
-    button_id = f"copy-button-{key}" if key else "copy-button"
-    html_code = f"""
-    <button id="{button_id}" onclick="navigator.clipboard.writeText('{escaped_text}')">{button_label}</button>
-    """
-    components.html(html_code, height=30, scrolling=False)
+def display_dataframe(df):
+    """DataFrameを通常の表示形式で表示します。"""
+    st.dataframe(df)
 
-def display_dataframe_with_copy(df):
-    """DataFrameを表示し、各行にコピー機能を追加します。"""
-    display_df = df.drop(columns=["重要度", "自信度", "情報種別"], errors='ignore')
-
-    for index, row in display_df.iterrows():
-        cols = st.columns(len(display_df.columns) + 1)  # +1 for the copy button
-        for i, col in enumerate(display_df.columns):
-            cols[i].write(row[col] if pd.notna(row[col]) else "")
-        copy_text = row["指摘箇所"] if "指摘箇所" in row else ""
-        if pd.notna(copy_text):
-            with cols[-1]:
-                copy_button(str(copy_text), key=f"copy_{index}")
-        else:
-            cols[-1].write("")
+def create_readable_chat_dataframe(chat_logs):
+    """チャットログを見やすい形式に整形したDataFrameを作成します。"""
+    records = []
+    for log in chat_logs:
+        page_or_chunk = log.get("page_num", log.get("chunk_index", None))
+        messages = log.get("messages", [])
+        response = log.get("response", "")
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            records.append({
+                "ページorチャンク": page_or_chunk,
+                "ロール": role,
+                "メッセージ内容": content
+            })
+        if response:
+            records.append({
+                "ページorチャンク": page_or_chunk,
+                "ロール": "assistant",
+                "メッセージ内容": response
+            })
+    return pd.DataFrame(records)
 
 st.title("文章AIチェックシステム_調整版")
 
@@ -465,16 +481,21 @@ if uploaded_file is not None:
         df_part = parse_json_results_to_dataframe(result_str, page_num)
         all_df_results = pd.concat([all_df_results, df_part], ignore_index=True)
 
+    # 重複削除
+    if not all_df_results.empty:
+        duplicate_key_columns = ["ページ番号", "指摘箇所", "指摘理由", "修正案"]
+        all_df_results.drop_duplicates(subset=duplicate_key_columns, keep='first', inplace=True)
+
     if not all_df_results.empty and "ページ番号" in all_df_results.columns:
         # 行番号・文字オフセット情報付加
         all_df_results = add_location_info(all_df_results, extracted_texts)
         all_df_results.sort_values(by=["ページ番号"], inplace=True)
 
         st.write("フィルタリング前のチェック結果:")
-        st.dataframe(all_df_results.drop(columns=["重要度", "自信度", "情報種別"], errors='ignore'))
+        st.dataframe(all_df_results)
     else:
         st.write("指摘事項がありませんでした。")
-        all_df_results = pd.DataFrame()  # 空にしておく
+        all_df_results = pd.DataFrame()
 
     # フィルタリング実行（非同期並列）
     if not all_df_results.empty:
@@ -491,11 +512,11 @@ if uploaded_file is not None:
         if filtered_results_df.empty:
             st.write("フィルタリング後に残った指摘事項はありません。")
         else:
-            display_dataframe_with_copy(filtered_results_df)
+            display_dataframe(filtered_results_df)
 
         if not excluded_results_df.empty:
             st.write("除外された指摘事項:")
-            st.dataframe(excluded_results_df.drop(columns=["重要度", "自信度", "情報種別"], errors='ignore'))
+            st.dataframe(excluded_results_df)
     else:
         filtered_results_df = pd.DataFrame()
         excluded_results_df = pd.DataFrame()
@@ -510,10 +531,12 @@ if uploaded_file is not None:
     st.write(f"チェック処理時間: {check_time:.2f} 秒")
     st.write(f"フィルタリング処理時間: {filtering_time:.2f} 秒")
 
-    # Excel出力用（不要列削除）
-    excel_filtered = filtered_results_df.drop(columns=["重要度", "自信度", "情報種別"], errors='ignore') if not filtered_results_df.empty else pd.DataFrame()
-    excel_excluded = excluded_results_df.drop(columns=["重要度", "自信度", "情報種別"], errors='ignore') if not excluded_results_df.empty else pd.DataFrame()
-    excel_all = all_df_results.drop(columns=["重要度", "自信度", "情報種別"], errors='ignore') if not all_df_results.empty else pd.DataFrame()
+    # Excel出力用
+    excel_filtered = filtered_results_df if not filtered_results_df.empty else pd.DataFrame()
+    excel_excluded = excluded_results_df if not excluded_results_df.empty else pd.DataFrame()
+    excel_all = all_df_results if not all_df_results.empty else pd.DataFrame()
+    excel_chat_logs = pd.DataFrame(chat_logs)
+    excel_chat_conversations = create_readable_chat_dataframe(chat_logs)
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
@@ -521,6 +544,10 @@ if uploaded_file is not None:
             excel_filtered.to_excel(writer, sheet_name='フィルタ後チェック結果', index=False)
         if not excel_excluded.empty:
             excel_excluded.to_excel(writer, sheet_name='除外された指摘項目', index=False)
+        if not excel_chat_logs.empty:
+            excel_chat_logs.to_excel(writer, sheet_name='チャットログ(Raw)', index=False)
+        if not excel_chat_conversations.empty:
+            excel_chat_conversations.to_excel(writer, sheet_name='チャット内容整形', index=False)
         page_times_df = pd.DataFrame(page_processing_times)
         page_times_df.to_excel(writer, sheet_name='ページ処理時間', index=False)
         summary_df = pd.DataFrame({
