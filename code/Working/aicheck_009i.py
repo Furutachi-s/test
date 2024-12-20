@@ -1,6 +1,6 @@
 import os
 import streamlit as st
-import fitz
+import fitz  # PyMuPDF
 from openai import AzureOpenAI
 import pandas as pd
 from io import BytesIO
@@ -10,6 +10,7 @@ import time
 import re
 import unicodedata
 import asyncio
+import base64
 
 st.set_page_config(layout="wide")
 
@@ -46,16 +47,12 @@ if "filtering_time" not in st.session_state:
     st.session_state.filtering_time = 0.0
 if "total_processing_time" not in st.session_state:
     st.session_state.total_processing_time = 0.0
-# 辞書ファイル用
-if "dictionary_words" not in st.session_state:
-    st.session_state.dictionary_words = set()
 
 def preprocess_text(text):
     text = unicodedata.normalize('NFKC', text)
     text = ''.join(ch for ch in text if unicodedata.category(ch)[0] != 'C' or ch in ['\n', '\t'])
     text = re.sub(r'[ \t]+', ' ', text)
-    # 日本語間空白除去は任意で行う/行わない
-    # text = re.sub(r'([ぁ-んァ-ン一-龥])\s+([ぁ-んァ-ン一-龥])', r'\1\2', text)
+    text = re.sub(r'([ぁ-んァ-ン一-龥])\s+([ぁ-んァ-ン一-龥])', r'\1\2', text)
     return text.strip()
 
 def rects_overlap(rect1, rect2):
@@ -101,11 +98,8 @@ def extract_text_excluding_images_and_header_footer(pdf_document):
                     in_hf = is_in_header_footer(block_bbox, page_height, header_height, footer_height)
                     if not overlaps_image and not in_hf:
                         for line in block["lines"]:
-                            # スパン間を半角スペースで結合
-                            line_text = " ".join(span["text"].strip() for span in line["spans"] if span["text"].strip())
-                            line_text = preprocess_text(line_text)
-                            if line_text:
-                                text_content += line_text + "\n"
+                            line_text = "".join(span["text"] for span in line["spans"])
+                            text_content += line_text + "\n"
                         text_content += "\n"
             text_content = preprocess_text(text_content)
             actual_page_num = page_num + 1
@@ -125,10 +119,30 @@ def extract_text_excluding_images_and_header_footer(pdf_document):
             extracted_texts_local.append({'ページ番号': page_num + 1, 'テキスト': ""})
 
     extract_end_time = time.time()
-    extract_time = extract_end_time - extract_start_time
+    extract_time_local = extract_end_time - extract_start_time
     extract_status_text.text("テキスト抽出完了")
-    st.write(f"テキスト抽出処理時間: {extract_time:.2f} 秒")
-    return page_texts, extract_time, page_processing_times_local, extracted_texts_local
+    st.write(f"テキスト抽出処理時間: {extract_time_local:.2f} 秒")
+    return page_texts, extract_time_local, page_processing_times_local, extracted_texts_local
+
+def extract_images_from_pdf(pdf_document):
+    """PDFの各ページから画像を抽出し、base64エンコードした画像データを返す"""
+    page_images = []
+    for page_num in range(len(pdf_document)):
+        page = pdf_document[page_num]
+        images_on_page = []
+        for img_index, img in enumerate(page.get_images(full=True)):
+            xref = img[0]
+            base_image = pdf_document.extract_image(xref)
+            image_bytes = base_image["image"]
+            image_ext = base_image["ext"]  # 画像の拡張子 (png, jpeg など)
+            
+            # 画像をbase64にエンコード
+            encoded_image = base64.b64encode(image_bytes).decode('utf-8')
+            image_data_url = f"data:image/{image_ext};base64,{encoded_image}"
+            images_on_page.append(image_data_url)
+        
+        page_images.append({"page_num": page_num + 1, "images": images_on_page})
+    return page_images
 
 def split_text_into_chunks_by_page(page_texts, chunk_size=2000, chunk_overlap=200):
     try:
@@ -144,39 +158,44 @@ def split_text_into_chunks_by_page(page_texts, chunk_size=2000, chunk_overlap=20
             page_chunks.append((page_num, chunk_text))
     return page_chunks
 
-async def async_check_text_with_openai(client, text, page_num, semaphore, chat_logs_local):
+async def async_check_text_and_images_with_openai(client, text, page_num, images, semaphore):
+    # 画像をHTMLイメージタグとして組み込む
+    image_tags = ""
+    for image_data_url in images:
+        image_tags += f'<img src="{image_data_url}" alt="page-{page_num}-image" style="max-width:100%;">\n'
+
     session_message = [
         {"role": "system", "content": """あなたは建設機械マニュアルのチェックアシスタントです。以下の事項を確認し、問題点を指摘してください。
 
 【指摘してほしい問題点】
 (1) 誤字や脱字
-(2) 意味伝達に支障がある文法ミス
-(3) 文脈的に誤った記載内容
+(2) 意味伝達に支障があるレベルの文法ミス
+(3) 文脈的に不適切、または誤った記載
+(4) 画像内の情報に関する問題点（例: 画像内のテキストラベルミス、文書と画像情報の不整合など）
 
 【指摘不要】
 - 不自然な改行・空白（PDF抽出由来の可能性が高い）
-- カタカナ用語の末尾長音の省略に関する指摘
+- カタカナ用語の末尾長音の省略に関する指摘（例：バッテリ→バッテリー）
 
 【回答形式】  
-- 出力は必ず **JSONのみ** を返し、それ以外の文字列（説明文など）は一切出力しないでください。
-- 問題がなければ空の配列 `[]` のみを返してください。
-- 問題がある場合は以下の形式で返してください。
+以下の形式で問題がある場合は列挙してください。  
+問題がなければ空の配列"[]"のみ出力してください。
 
 [
   {
     "page": <page_num>,
-    "category": "誤字" or "文法" or "文脈",
+    "category": "誤字" or "文法" or "文脈" or "画像",
     "reason": "具体的な理由",
     "error_location": "指摘箇所",
     "suggestion": "修正案"
   }
 ]
-"""},
-        {"role": "user", "content": f"以下は、PDF抽出テキストの一部です（該当ページ: {page_num}）。\n\n{text}" }
+""" },
+        {"role": "user", "content": f"以下は、PDF抽出テキストの一部と画像です（該当ページ: {page_num}）。\n\n【テキスト】:\n{text}\n\n【画像】:\n{image_tags}"}
     ]
 
     async with semaphore:
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.5)  # レート制限対策
         for attempt in range(3):
             try:
                 response = await asyncio.to_thread(
@@ -186,7 +205,7 @@ async def async_check_text_with_openai(client, text, page_num, semaphore, chat_l
                     max_tokens=2000,
                     messages=session_message
                 )
-                chat_logs_local.append({
+                st.session_state.chat_logs.append({
                     "page_num": page_num,
                     "messages": session_message,
                     "response": response.choices[0].message.content
@@ -198,60 +217,31 @@ async def async_check_text_with_openai(client, text, page_num, semaphore, chat_l
                     await asyncio.sleep(5)
                 else:
                     st.warning(f"ページ {page_num} のチェックに失敗しました。")
-                    chat_logs_local.append({
+                    st.session_state.chat_logs.append({
                         "page_num": page_num,
                         "messages": session_message,
                         "response": f"エラー: {ex}"
                     })
                     return (page_num, "")
 
-async def run_async_check(client, page_chunks, progress_bar, check_status_text, chat_logs_local):
-    non_empty_chunks = [(p, t) for p, t in page_chunks if t.strip()]
+async def run_async_check_with_images(client, page_texts, page_images):
     semaphore = asyncio.Semaphore(5)
-    
-    tasks = [async_check_text_with_openai(client, chunk_text, page_num, semaphore, chat_logs_local)
-             for (page_num, chunk_text) in non_empty_chunks]
-    
-    tasks = [asyncio.create_task(task) for task in tasks]
-    
-    total_tasks = len(tasks)
-    if total_tasks == 0:
-        check_status_text.write("チェック対象がありません。")
-        return [], non_empty_chunks, 0
-
-    completed = 0
-    check_start_time = time.time()
-    results = []
-    check_status_text.text("チェック処理を開始します...")
-    progress_bar.progress(0.0)
-
-    for task in asyncio.as_completed(tasks):
-        page_num, result = await task
-        results.append((page_num, result))
-        completed += 1
-        progress = completed / total_tasks
-        progress_bar.progress(progress)
-        check_status_text.text(f"チェック中... {completed}/{total_tasks} チャンク完了")
-
-    check_end_time = time.time()
-    check_time_local = check_end_time - check_start_time
-    check_status_text.text(f"チェックが完了しました！ (処理時間: {check_time_local:.2f} 秒)")
-    progress_bar.progress(1.0)
-
-    return results, non_empty_chunks, check_time_local
+    tasks = []
+    # ページごとに、テキストと対応する画像リストを取得
+    for page_num, text in page_texts:
+        images = next((item["images"] for item in page_images if item["page_num"] == page_num), [])
+        tasks.append(async_check_text_and_images_with_openai(client, text, page_num, images, semaphore))
+    results = await asyncio.gather(*tasks)
+    return results
 
 def parse_json_results_to_dataframe(results, page_num):
     if not results.strip():
         return pd.DataFrame()
 
-    text = re.sub(r'^```(?:json)?', '', results.strip())
-    text = re.sub(r'```$', '', text)
-    text = text.strip()
-
     try:
-        json_results = json.loads(text)
+        json_results = json.loads(results.strip())
     except json.JSONDecodeError:
-        st.write(f"ページ {page_num} のJSON解析に失敗しました。返却値: {text[:200]}...")
+        st.write(f"ページ {page_num} のJSON解析に失敗しました。")
         return pd.DataFrame()
 
     if not isinstance(json_results, list):
@@ -294,17 +284,16 @@ def parse_filter_response(response_text):
     excluded_results = json_data.get('excluded_results', [])
     return filtered_results, excluded_results
 
-async def async_filter_chunk_with_openai(client, df_chunk, chunk_index, semaphore, chat_logs_local):
+async def async_filter_chunk_with_openai(client, df_chunk, chunk_index, semaphore):
     system_prompt = """あなたはチェック結果を整理するフィルタリングアシスタントです。
 以下の方針で、チェック結果をふるい分けてください。
 
 【excluded_results に回す項目】  
-- 不自然な改行や空白に関する指摘
+- 不自然な改行や空白のみの問題
 - カタカナ末尾長音有無の揺れのみ
-- 指摘箇所と修正案が全く同じ項目
 
 【filtered_results に残す項目】  
-- 上記以外の誤字・文法・文脈ミス
+- 上記以外の重要な誤字・文法・文脈・画像関連ミス
 
 必ず以下形式のJSONのみを出力してください:
 {
@@ -340,7 +329,7 @@ async def async_filter_chunk_with_openai(client, df_chunk, chunk_index, semaphor
                     max_tokens=2000,
                     messages=session_message
                 )
-                chat_logs_local.append({
+                st.session_state.chat_logs.append({
                     "chunk_index": chunk_index,
                     "messages": session_message,
                     "response": response.choices[0].message.content
@@ -353,14 +342,14 @@ async def async_filter_chunk_with_openai(client, df_chunk, chunk_index, semaphor
                     await asyncio.sleep(5)
                 else:
                     st.warning(f"フィルタリングチャンク {chunk_index} の処理に失敗しました。")
-                    chat_logs_local.append({
+                    st.session_state.chat_logs.append({
                         "chunk_index": chunk_index,
                         "messages": session_message,
                         "response": f"エラー: {ex}"
                     })
                     return [], []
 
-async def run_async_filter(client, df_results, chunk_size, progress_bar, chat_logs_local):
+async def run_async_filter(client, df_results, chunk_size, progress_bar):
     filtered_results_list = []
     excluded_results_list = []
     total_results = len(df_results)
@@ -387,7 +376,7 @@ async def run_async_filter(client, df_results, chunk_size, progress_bar, chat_lo
         tasks.append((i+1, df_chunk))
 
     completed = 0
-    async_tasks = [async_filter_chunk_with_openai(client, chunk_df, idx, semaphore, chat_logs_local) for idx, chunk_df in tasks]
+    async_tasks = [async_filter_chunk_with_openai(client, chunk_df, idx, semaphore) for idx, chunk_df in tasks]
 
     for coro, (idx, _) in zip(asyncio.as_completed(async_tasks), tasks):
         f_chunk, e_chunk = await coro
@@ -466,27 +455,12 @@ def create_readable_chat_dataframe(chat_logs_local):
             })
     return pd.DataFrame(records)
 
-
-st.title("文章AIチェックシステム_調整版")
+st.title("文章AIチェックシステム_画像対応版")
 
 uploaded_file = st.file_uploader("PDFファイルをアップロードしてください", type="pdf")
 
-# 改善点: PDFアップロード後に辞書用Excelをアップロードさせる
-dictionary_file = None
-if st.session_state.uploaded_pdf_data is None and uploaded_file is not None:
-    # PDFを読み込んだ後に辞書ファイルアップロードを促す
-    st.write("辞書用Excelファイル(除外用ワード一覧)をアップロードしてください(A列にワード):")
-    dictionary_file = st.file_uploader("辞書ファイル(Excel形式)", type=["xlsx", "xls"])
-
-if uploaded_file is not None and st.session_state.uploaded_pdf_data is None and dictionary_file is not None:
+if uploaded_file is not None and st.session_state.uploaded_pdf_data is None:
     st.session_state.uploaded_pdf_data = uploaded_file.read()
-    # 辞書ファイルを読み込み
-    if dictionary_file is not None:
-        dict_df = pd.read_excel(dictionary_file, sheet_name=0, header=None)
-        # A列をすべて文字列化、NaNを除外
-        dict_df = dict_df.dropna(subset=[0])
-        st.session_state.dictionary_words = set(dict_df[0].astype(str).str.strip().tolist())
-
 
 if st.session_state.uploaded_pdf_data is not None and not st.session_state.processing_done:
     total_start_time = time.time()
@@ -500,27 +474,27 @@ if st.session_state.uploaded_pdf_data is not None and not st.session_state.proce
     st.session_state.extracted_texts = extracted_texts_local
     st.session_state.extract_time = extract_time_local
 
-    page_chunks = split_text_into_chunks_by_page(page_texts)
-    st.write(f"チャンク分割数: {len(page_chunks)}")
+    # 画像抽出
+    page_images = extract_images_from_pdf(doc)
 
+    # 非同期でテキスト＋画像チェック
     st.subheader("チェック進捗状況")
     progress_bar = st.progress(0)
     check_status_text = st.empty()
 
-    chat_logs_local = []
-    results, used_chunks, check_time_local = asyncio.run(run_async_check(client, page_chunks, progress_bar, check_status_text, chat_logs_local))
-    st.session_state.chat_logs = chat_logs_local
-    st.session_state.check_time = check_time_local
-
+    results = asyncio.run(run_async_check_with_images(client, page_texts, page_images))
+    # チェック結果解析
     all_df_results_local = pd.DataFrame()
     for (page_num, result_str) in results:
         df_part = parse_json_results_to_dataframe(result_str, page_num)
         all_df_results_local = pd.concat([all_df_results_local, df_part], ignore_index=True)
 
+    # 重複削除
     if not all_df_results_local.empty:
         duplicate_key_columns = ["ページ番号", "指摘箇所", "指摘理由", "修正案"]
         all_df_results_local.drop_duplicates(subset=duplicate_key_columns, keep='first', inplace=True)
 
+    # 行番号・オフセット付与
     if not all_df_results_local.empty and "ページ番号" in all_df_results_local.columns:
         all_df_results_local = add_location_info(all_df_results_local, st.session_state.extracted_texts)
         all_df_results_local.sort_values(by=["ページ番号"], inplace=True)
@@ -533,40 +507,20 @@ if st.session_state.uploaded_pdf_data is not None and not st.session_state.proce
 
     st.session_state.all_df_results = all_df_results_local
 
+    # フィルタリング
     if not all_df_results_local.empty:
         st.subheader("チェック結果フィルタリング中...")
         filtering_progress = st.progress(0)
-        filtered_results_df_local, excluded_results_df_local, filtering_time_local = asyncio.run(run_async_filter(client, all_df_results_local, chunk_size=5, progress_bar=filtering_progress, chat_logs_local=st.session_state.chat_logs))
-
-        # ※ここで辞書を用いた除外処理を追加
-        if not filtered_results_df_local.empty:
-            # 指摘箇所が辞書に含まれるものをexcludedへ移動
-            in_dict = filtered_results_df_local["指摘箇所"].isin(st.session_state.dictionary_words)
-            dict_excluded = filtered_results_df_local[in_dict]
-            if not dict_excluded.empty:
-                # 既存excludedと結合
-                excluded_results_df_local = pd.concat([excluded_results_df_local, dict_excluded], ignore_index=True)
-                # filteredから削除
-                filtered_results_df_local = filtered_results_df_local[~in_dict]
-
-        if not filtered_results_df_local.empty and "ページ番号" in filtered_results_df_local.columns:
-            filtered_results_df_local.sort_values(by=["ページ番号"], inplace=True)
-        if not excluded_results_df_local.empty and "ページ番号" in excluded_results_df_local.columns:
-            excluded_results_df_local.sort_values(by=["ページ番号"], inplace=True)
-
-        st.write("フィルタリング後のチェック結果:")
-        if filtered_results_df_local.empty:
-            st.write("フィルタリング後に残った指摘事項はありません。")
-        else:
-            display_dataframe(filtered_results_df_local)
-
-        if not excluded_results_df_local.empty:
-            st.write("除外された指摘事項:")
-            st.dataframe(excluded_results_df_local)
+        filtered_results_df_local, excluded_results_df_local, filtering_time_local = asyncio.run(run_async_filter(client, all_df_results_local, chunk_size=5, progress_bar=filtering_progress))
     else:
         filtered_results_df_local = pd.DataFrame()
         excluded_results_df_local = pd.DataFrame()
         filtering_time_local = 0.0
+
+    if not filtered_results_df_local.empty:
+        filtered_results_df_local.sort_values(by=["ページ番号"], inplace=True)
+    if not excluded_results_df_local.empty:
+        excluded_results_df_local.sort_values(by=["ページ番号"], inplace=True)
 
     st.session_state.filtered_results_df = filtered_results_df_local
     st.session_state.excluded_results_df = excluded_results_df_local
@@ -576,10 +530,21 @@ if st.session_state.uploaded_pdf_data is not None and not st.session_state.proce
     total_processing_time_local = total_end_time - total_start_time
     st.session_state.total_processing_time = total_processing_time_local
 
+    # 結果表示
     st.write(f"総処理時間: {total_processing_time_local:.2f} 秒")
     st.write(f"テキスト抽出処理時間: {extract_time_local:.2f} 秒")
-    st.write(f"チェック処理時間: {check_time_local:.2f} 秒")
+    st.write(f"チェック処理時間: {(st.session_state.check_time or 0.0):.2f} 秒")  # check_timeは今回はrun_async_check_with_images内で計測したければ同様に計測可能
     st.write(f"フィルタリング処理時間: {filtering_time_local:.2f} 秒")
+
+    if filtered_results_df_local.empty:
+        st.write("フィルタリング後に残った指摘事項はありません。")
+    else:
+        st.write("フィルタリング後のチェック結果:")
+        display_dataframe(filtered_results_df_local)
+
+    if not excluded_results_df_local.empty:
+        st.write("除外された指摘事項:")
+        st.dataframe(excluded_results_df_local)
 
     st.session_state.processing_done = True
 
