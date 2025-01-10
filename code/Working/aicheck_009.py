@@ -54,6 +54,13 @@ def get_openai_client() -> AzureOpenAI:
 
 client = get_openai_client()
 
+# --- 使用するモデル選択 ---
+model_selection = st.selectbox(
+    "使用するモデル(デプロイ名)を選択してください:",
+    ["gpt-4o", "o1-mini", "o1-preview"],
+    index=0
+)
+
 # --- テキスト前処理 ---
 def preprocess_text(text: str) -> str:
     """テキストの前処理を行う。"""
@@ -145,7 +152,7 @@ def extract_text_excluding_images_and_header_footer(pdf_document: fitz.Document)
 def split_text_into_chunks_by_page(page_texts: List[Tuple[int, str]], chunk_size: int = 2000, chunk_overlap: int = 200) -> List[Tuple[int, str]]:
     """ページごとのテキストをチャンクに分割する。"""
     try:
-        encoding = tiktoken.encoding_for_model('gpt-4o')
+        encoding = tiktoken.encoding_for_model(model_selection)
     except:
         encoding = tiktoken.get_encoding('cl100k_base')
     page_chunks = []
@@ -156,6 +163,30 @@ def split_text_into_chunks_by_page(page_texts: List[Tuple[int, str]], chunk_size
             chunk_text = encoding.decode(chunk_tokens)
             page_chunks.append((page_num, chunk_text))
     return page_chunks
+
+# --- パラメータ切り替え用関数 ---
+def get_chat_completion_params() -> Dict[str, Any]:
+    """
+    モデルに応じてOpenAI API呼び出しのパラメータを設定する。
+    """
+    if model_selection == "o1-preview":
+        # temperatureを1に固定
+        return {
+            "max_completion_tokens": 2000,
+            "temperature": 1
+        }
+    elif model_selection.startswith("o1"):
+        # o1-miniなどのo1系モデルではtemperatureを指定しない
+        return {
+            "max_completion_tokens": 2000
+            # temperatureはデフォルト値（1）を使用
+        }
+    else:
+        # gpt-4oなど4o系モデル
+        return {
+            "max_tokens": 2000,
+            "temperature": 0
+        }
 
 # --- JSON文字列をDataFrameに変換 ---
 def parse_json_results_to_dataframe(results: str, page_num: int) -> pd.DataFrame:
@@ -220,7 +251,7 @@ def parse_filter_response(response_text: str) -> Tuple[List[Any], List[Any]]:
 # --- OpenAI API呼び出し(非同期): チェック ---
 async def async_check_text_with_openai(client: AzureOpenAI, text: str, page_num: int, semaphore: asyncio.Semaphore, chat_logs_local: List[Dict[str, Any]]) -> Tuple[int, str]:
     """OpenAI APIを非同期で呼び出し、テキストのチェックを行う。"""
-    system_prompt = """あなたは建設機械マニュアルのチェックアシスタントです。以下の事項を確認し、資料の品質をチェックしてください。
+    combined_prompt = f"""あなたは建設機械マニュアルのチェックアシスタントです。以下の事項を確認し、資料の品質をチェックしてください。
 
 【指摘してほしい問題点】
 (1) 誤字や脱字
@@ -233,7 +264,6 @@ async def async_check_text_with_openai(client: AzureOpenAI, text: str, page_num:
 
 【分析用要件】
 - どの指示に従って検出したかを "prompt_source" フィールドに記載してください。
-  (例: "誤字や脱字の指示に基づく" / "文脈的に誤った記載の指示に基づく" など)
 
 【指摘不要】
 - 不自然な改行・空白（PDF抽出由来のため）
@@ -245,34 +275,37 @@ async def async_check_text_with_openai(client: AzureOpenAI, text: str, page_num:
 
 【JSONフォーマット例】
 [
-  {
-    "page": <page_num>,
+  {{
+    "page": {page_num},
     "category": "誤字" or "文法" or "文脈",
     "reason": "具体的な理由",
     "error_location": "指摘箇所",
     "suggestion": "修正案",
     "importance": "高" or "低",
     "prompt_source": "どの指示による検出なのかを簡潔に"
-  }
+  }}
 ]
+
+以下は、PDF抽出テキストの一部です（該当ページ: {page_num}）。
+---------------------------------------
+{text}
 """
 
-    user_prompt = f"以下は、PDF抽出テキストの一部です（該当ページ: {page_num}）。\n\n{text}"
     session_message = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt}
+        {"role": "user", "content": combined_prompt}
     ]
 
+    chat_params = get_chat_completion_params()
+
     async with semaphore:
+        await asyncio.sleep(1.0)  # レート制限対策
         for attempt in range(3):
             try:
-                await asyncio.sleep(1.0)  # レート制限対策
                 response = await asyncio.to_thread(
                     client.chat.completions.create,
-                    model="gpt-4o",
-                    temperature=0,
-                    max_tokens=2000,
-                    messages=session_message
+                    model=model_selection,
+                    messages=session_message,
+                    **chat_params
                 )
                 assistant_response = response.choices[0].message.content
                 chat_logs_local.append({
@@ -323,23 +356,29 @@ async def async_filter_chunk_with_openai(client: AzureOpenAI, df_chunk: pd.DataF
 
     check_results_json = df_chunk.to_dict(orient='records')
     check_results_str = json.dumps(check_results_json, ensure_ascii=False, indent=2)
-    user_prompt = f"以下はチェック結果のリストです。\n\n{check_results_str}\n\n上記ルールに基づき、\"filtered_results\"と\"excluded_results\"に振り分けてください。"
+    user_prompt = f"""以下はチェック結果のリストです。
+
+{check_results_str}
+
+上記ルールに基づき、"filtered_results"と"excluded_results"に振り分けてください。"""
+
+    combined_prompt = system_prompt + "\n\n" + user_prompt
 
     session_message = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt}
+        {"role": "user", "content": combined_prompt}
     ]
 
+    chat_params = get_chat_completion_params()
+
     async with semaphore:
+        await asyncio.sleep(0.5)  # レート制限対策
         for attempt in range(3):
             try:
-                await asyncio.sleep(0.5)  # レート制限対策
                 response = await asyncio.to_thread(
                     client.chat.completions.create,
-                    model="gpt-4o",
-                    temperature=0,
-                    max_tokens=2000,
-                    messages=session_message
+                    model=model_selection,
+                    messages=session_message,
+                    **chat_params
                 )
                 assistant_response = response.choices[0].message.content
                 chat_logs_local.append({
@@ -347,8 +386,8 @@ async def async_filter_chunk_with_openai(client: AzureOpenAI, df_chunk: pd.DataF
                     "messages": session_message,
                     "response": assistant_response
                 })
-                filtered, excluded = parse_filter_response(assistant_response)
-                return filtered, excluded
+                filtered_chunk, excluded_chunk = parse_filter_response(assistant_response)
+                return filtered_chunk, excluded_chunk
             except Exception as ex:
                 if attempt < 2:
                     st.write(f"フィルタリングチャンク {chunk_index} の処理中にエラーが発生しました。再試行します... ({ex})")
@@ -363,7 +402,7 @@ async def async_filter_chunk_with_openai(client: AzureOpenAI, df_chunk: pd.DataF
                     return [], []
 
 # --- OpenAI API呼び出し(非同期): チェック実行 ---
-async def run_async_check(client: AzureOpenAI, page_chunks: List[Tuple[int, str]], progress_bar: st.progress, check_status_text: st.empty, chat_logs_local: List[Dict[str, Any]]) -> Tuple[List[Tuple[int, str]], List[Tuple[int, str]], float]:
+async def run_async_check(client: AzureOpenAI, page_chunks: List[Tuple[int, str]], check_progress_bar: st.progress, check_status_text: st.empty, chat_logs_local: List[Dict[str, Any]]) -> Tuple[List[Tuple[int, str]], float]:
     """非同期でチェックを実行する。"""
     non_empty_chunks = [(p, t) for p, t in page_chunks if t.strip()]
     semaphore = asyncio.Semaphore(5)
@@ -378,37 +417,37 @@ async def run_async_check(client: AzureOpenAI, page_chunks: List[Tuple[int, str]
     total_tasks = len(tasks)
     if total_tasks == 0:
         check_status_text.write("チェック対象がありません。")
-        return [], [], 0.0
+        return [], 0.0
 
     completed = 0
     check_start_time = time.time()
     results = []
     check_status_text.text("チェック処理を開始します...")
-    progress_bar.progress(0.0)
+    check_progress_bar.progress(0.0)
 
     for task in asyncio.as_completed(tasks):
         page_num, result = await task
         results.append((page_num, result))
         completed += 1
         progress = completed / total_tasks
-        progress_bar.progress(progress)
+        check_progress_bar.progress(progress)
         check_status_text.text(f"チェック中... {completed}/{total_tasks} チャンク完了")
 
     check_end_time = time.time()
     check_time_local = check_end_time - check_start_time
     check_status_text.text(f"チェックが完了しました！ (処理時間: {check_time_local:.2f} 秒)")
-    progress_bar.progress(1.0)
+    check_progress_bar.progress(1.0)
 
-    return results, non_empty_chunks, check_time_local
+    return results, check_time_local
 
 # --- フィルタリング実行(非同期) ---
-async def run_async_filter(client: AzureOpenAI, df_results: pd.DataFrame, chunk_size: int, progress_bar: st.progress, chat_logs_local: List[Dict[str, Any]]) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
+async def run_async_filter(client: AzureOpenAI, df_results: pd.DataFrame, chunk_size: int, filtering_progress_bar: st.progress, chat_logs_local: List[Dict[str, Any]]) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
     """非同期でフィルタリングを実行する。"""
     filtered_results_list = []
     excluded_results_list = []
     total_results = len(df_results)
     if total_results == 0:
-        progress_bar.progress(1.0)
+        filtering_progress_bar.progress(1.0)
         return pd.DataFrame(), pd.DataFrame(), 0.0
 
     filtering_start_time = time.time()
@@ -416,7 +455,7 @@ async def run_async_filter(client: AzureOpenAI, df_results: pd.DataFrame, chunk_
 
     filter_status_text = st.empty()
     filter_status_text.text("フィルタリング中...")
-    progress_bar.progress(0.0)
+    filtering_progress_bar.progress(0.0)
 
     semaphore = asyncio.Semaphore(5)
     tasks = [
@@ -433,7 +472,7 @@ async def run_async_filter(client: AzureOpenAI, df_results: pd.DataFrame, chunk_
         excluded_results_list.extend(e_chunk)
         completed += 1
         progress = completed / num_chunks
-        progress_bar.progress(progress)
+        filtering_progress_bar.progress(progress)
         filter_status_text.text(f"フィルタリング中... {completed}/{num_chunks} チャンク完了")
 
     filtering_end_time = time.time()
@@ -468,8 +507,8 @@ def add_location_info(df: pd.DataFrame, extracted_texts: List[Dict[str, Any]]) -
             # 近似検索（スペース区切り）
             words = err_loc.split()
             candidates = [full_text.find(w) for w in words if w and full_text.find(w) != -1]
-            idx = min(candidates) if candidates else -1
-
+            if candidates:
+                idx = min(candidates)
         if idx == -1:
             continue
 
@@ -508,164 +547,211 @@ def create_readable_chat_dataframe(chat_logs_local: List[Dict[str, Any]]) -> pd.
             })
     return pd.DataFrame(records)
 
-# --- JSONフィルタリング関数 (不要なので削除) ---
-# --- ここでは関数を必要に応じて定義してください。 ---
-
 # --- アプリタイトル ---
 st.title("文章AIチェックシステム_調整版")
 
+# --- ファイルアップロードセクション ---
+st.header("ファイルのアップロード")
+
 # --- PDFアップロードUI ---
-uploaded_file = st.file_uploader("PDFファイルをアップロードしてください", type="pdf")
+uploaded_file = st.file_uploader("PDFファイルをアップロードしてください", type="pdf", key="pdf_uploader")
 
 # --- 辞書ファイルアップロードUI ---
 dictionary_file = None
-if st.session_state.uploaded_pdf_data is None and uploaded_file is not None:
-    st.write("【任意】辞書用Excelファイル(除外用ワード一覧)をアップロードする場合はA列にワードを入れてください:")
-    dictionary_file = st.file_uploader("辞書ファイル(Excel形式)", type=["xlsx", "xls"])
-
-# --- PDF & 辞書ファイル読み込み ---
 if uploaded_file is not None and st.session_state.uploaded_pdf_data is None:
-    # PDF読み込み
-    st.session_state.uploaded_pdf_data = uploaded_file.read()
-    # 辞書ファイル読み込み
-    if dictionary_file is not None:
+    st.write("【任意】辞書用Excelファイル(除外用ワード一覧)をアップロードする場合はA列にワードを入れてください:")
+    dictionary_file = st.file_uploader("辞書ファイル(Excel形式)", type=["xlsx", "xls"], key="dict_uploader")
+
+# --- 処理開始ボタン ---
+if uploaded_file is not None and not st.session_state.processing_done:
+    if st.button("処理開始"):
+        # PDF読み込み
         try:
-            dict_df = pd.read_excel(dictionary_file, sheet_name=0, header=None)
-            dict_df = dict_df.dropna(subset=[0])
-            st.session_state.dictionary_words = set(dict_df[0].astype(str).str.strip().tolist())
-            st.success("辞書ファイルを正常に読み込みました。")
+            st.session_state.uploaded_pdf_data = uploaded_file.read()
+            st.success("PDFファイルを正常にアップロードしました。")
         except Exception as e:
-            st.error(f"辞書ファイルの読み込みに失敗しました: {e}")
+            st.error(f"PDFファイルの読み込みに失敗しました: {e}")
+            st.stop()
+        
+        # 辞書ファイル読み込み
+        if dictionary_file is not None:
+            try:
+                dict_df = pd.read_excel(dictionary_file, sheet_name=0, header=None)
+                dict_df = dict_df.dropna(subset=[0])
+                st.session_state.dictionary_words = set(dict_df[0].astype(str).str.strip().tolist())
+                st.success("辞書ファイルを正常に読み込みました。")
+            except Exception as e:
+                st.error(f"辞書ファイルの読み込みに失敗しました: {e}")
+                st.stop()
+        
+        # 処理を開始
+        st.session_state.processing_done = False  # 再度処理が開始される場合に備える
 
-# --- メイン処理: PDFデータがあり、まだ処理していない場合 ---
+# --- リセットボタン ---
+if st.button("リセット"):
+    initialize_session_state()
+    st.experimental_rerun()
+
+# --- メイン処理 ---
 if st.session_state.uploaded_pdf_data is not None and not st.session_state.processing_done:
-    total_start_time = time.time()
+    with st.spinner("処理を実行中..."):
+        total_start_time = time.time()
 
-    # PDFを読み込み
-    try:
-        doc = fitz.open(stream=st.session_state.uploaded_pdf_data, filetype="pdf")
-    except Exception as e:
-        st.error(f"PDFの読み込みに失敗しました: {e}")
-        st.stop()
-
-    # テキスト抽出
-    page_texts, extract_time_local, page_processing_times_local, extracted_texts_local = extract_text_excluding_images_and_header_footer(doc)
-    total_pages = len(doc)
-    st.write(f"読み込んだページ数: {len(page_texts)} / {total_pages}")
-
-    # セッションステートに保存
-    st.session_state.page_processing_times = page_processing_times_local
-    st.session_state.extracted_texts = extracted_texts_local
-    st.session_state.extract_time = extract_time_local
-
-    # チャンク分割
-    page_chunks = split_text_into_chunks_by_page(page_texts)
-    st.write(f"チャンク分割数: {len(page_chunks)}")
-
-    # チェック進捗表示
-    st.subheader("チェック進捗状況")
-    check_progress_bar = st.progress(0)
-    check_status_text = st.empty()
-
-    # 非同期チェック実行
-    chat_logs_local = []
-    try:
-        results, used_chunks, check_time_local = asyncio.run(
-            run_async_check(client, page_chunks, check_progress_bar, check_status_text, chat_logs_local)
-        )
-    except Exception as e:
-        st.error(f"チェック処理中にエラーが発生しました: {e}")
-        st.stop()
-
-    st.session_state.chat_logs = chat_logs_local
-    st.session_state.check_time = check_time_local
-
-    # チェック結果を統合
-    all_df_results_local = pd.DataFrame()
-    for page_num, result_str in results:
-        df_part = parse_json_results_to_dataframe(result_str, page_num)
-        all_df_results_local = pd.concat([all_df_results_local, df_part], ignore_index=True)
-
-    # 重複削除
-    if not all_df_results_local.empty:
-        duplicate_key_columns = ["ページ番号", "指摘箇所", "指摘理由", "修正案"]
-        all_df_results_local.drop_duplicates(subset=duplicate_key_columns, keep='first', inplace=True)
-
-    # 行番号付加
-    if not all_df_results_local.empty and "ページ番号" in all_df_results_local.columns:
-        all_df_results_local = add_location_info(all_df_results_local, st.session_state.extracted_texts)
-        all_df_results_local.sort_values(by=["ページ番号"], inplace=True)
-        st.write("フィルタリング前のチェック結果:")
-        st.dataframe(all_df_results_local)
-    else:
-        st.write("指摘事項がありませんでした。")
-        all_df_results_local = pd.DataFrame()
-
-    st.session_state.all_df_results = all_df_results_local
-
-    # フィルタリング
-    if not all_df_results_local.empty:
-        st.subheader("チェック結果フィルタリング中...")
-        filtering_progress = st.progress(0)
+        # PDFを読み込み
         try:
-            filtered_results_df_local, excluded_results_df_local, filtering_time_local = asyncio.run(
-                run_async_filter(client, all_df_results_local, chunk_size=5, progress_bar=filtering_progress, chat_logs_local=st.session_state.chat_logs)
+            doc = fitz.open(stream=st.session_state.uploaded_pdf_data, filetype="pdf")
+        except Exception as e:
+            st.error(f"PDFの読み込みに失敗しました: {e}")
+            st.stop()
+
+        # テキスト抽出
+        page_texts, extract_time_local, page_processing_times_local, extracted_texts_local = extract_text_excluding_images_and_header_footer(doc)
+        total_pages = len(doc)
+        st.write(f"読み込んだページ数: {len(page_texts)} / {total_pages}")
+
+        # セッションステートに保存
+        st.session_state.page_processing_times = page_processing_times_local
+        st.session_state.extracted_texts = extracted_texts_local
+        st.session_state.extract_time = extract_time_local
+
+        # チャンク分割
+        page_chunks = split_text_into_chunks_by_page(page_texts)
+        st.write(f"チャンク分割数: {len(page_chunks)}")
+
+        # 全体進捗表示
+        st.subheader("全体の進捗状況")
+        overall_progress_bar = st.progress(0.0)
+        overall_status_text = st.empty()
+
+        # 各ステップの進捗を管理するためのステータス変数
+        steps = ["テキスト抽出", "チェック", "フィルタリング"]
+        step_progress = {"テキスト抽出": 100, "チェック": 0, "フィルタリング": 0}
+
+        # テキスト抽出完了時に進捗を更新
+        # 既にテキスト抽出が完了しているため、全体進捗をテキスト抽出分として更新
+        step_weight = {"テキスト抽出": 30, "チェック": 50, "フィルタリング": 20}
+        overall_progress = 0
+        overall_progress += step_weight["テキスト抽出"]
+        overall_progress_bar.progress(overall_progress / 100)
+        overall_status_text.text(f"全体進捗: テキスト抽出完了 ({step_weight['テキスト抽出']}%)")
+
+        # チェック進捗表示
+        st.subheader("チェック進捗状況")
+        check_progress_bar = st.progress(0)
+        check_status_text = st.empty()
+
+        # 非同期チェック実行
+        chat_logs_local = []
+        try:
+            results, check_time_local = asyncio.run(
+                run_async_check(client, page_chunks, check_progress_bar, check_status_text, chat_logs_local)
             )
         except Exception as e:
-            st.error(f"フィルタリング処理中にエラーが発生しました: {e}")
-            filtered_results_df_local, excluded_results_df_local, filtering_time_local = pd.DataFrame(), pd.DataFrame(), 0.0
+            st.error(f"チェック処理中にエラーが発生しました: {e}")
+            st.stop()
 
-        # AIフィルタリングによる除外
-        if not excluded_results_df_local.empty:
-            excluded_results_df_local["除外理由"] = "AIフィルタリングによる"
+        st.session_state.chat_logs = chat_logs_local
+        st.session_state.check_time = check_time_local
 
-        # 辞書による除外
-        if not filtered_results_df_local.empty and st.session_state.dictionary_words:
-            in_dict = filtered_results_df_local["指摘箇所"].isin(st.session_state.dictionary_words)
-            dict_excluded = filtered_results_df_local[in_dict].copy()
-            if not dict_excluded.empty:
-                dict_excluded["除外理由"] = "辞書により除外"
-                excluded_results_df_local = pd.concat([excluded_results_df_local, dict_excluded], ignore_index=True)
-                filtered_results_df_local = filtered_results_df_local[~in_dict]
+        # チェック結果を統合
+        all_df_results_local = pd.DataFrame()
+        for page_num, result_str in results:
+            df_part = parse_json_results_to_dataframe(result_str, page_num)
+            all_df_results_local = pd.concat([all_df_results_local, df_part], ignore_index=True)
 
-        # ソート
-        if not filtered_results_df_local.empty and "ページ番号" in filtered_results_df_local.columns:
-            filtered_results_df_local.sort_values(by=["ページ番号"], inplace=True)
-        if not excluded_results_df_local.empty and "ページ番号" in excluded_results_df_local.columns:
-            excluded_results_df_local.sort_values(by=["ページ番号"], inplace=True)
+        # 重複削除
+        if not all_df_results_local.empty:
+            duplicate_key_columns = ["ページ番号", "指摘箇所", "指摘理由", "修正案"]
+            all_df_results_local.drop_duplicates(subset=duplicate_key_columns, keep='first', inplace=True)
 
-        # 結果表示
-        st.write("フィルタリング後のチェック結果:")
-        if filtered_results_df_local.empty:
-            st.write("フィルタリング後に残った指摘事項はありません。")
+        # 行番号付加
+        if not all_df_results_local.empty and "ページ番号" in all_df_results_local.columns:
+            all_df_results_local = add_location_info(all_df_results_local, st.session_state.extracted_texts)
+            all_df_results_local.sort_values(by=["ページ番号"], inplace=True)
+            st.write("フィルタリング前のチェック結果:")
+            st.dataframe(all_df_results_local)
         else:
-            display_dataframe(filtered_results_df_local)
+            st.write("指摘事項がありませんでした。")
+            all_df_results_local = pd.DataFrame()
 
-        if not excluded_results_df_local.empty:
-            st.write("除外された指摘事項:")
-            st.dataframe(excluded_results_df_local)
+        st.session_state.all_df_results = all_df_results_local
 
-    else:
-        filtered_results_df_local = pd.DataFrame()
-        excluded_results_df_local = pd.DataFrame()
-        filtering_time_local = 0.0
+        # 全体進捗の更新（チェックステップの完了度を反映）
+        overall_progress += step_weight["チェック"] * (len(results) / len(page_chunks))
+        overall_progress = min(overall_progress, 100)
+        overall_progress_bar.progress(overall_progress / 100)
+        overall_status_text.text(f"全体進捗: テキスト抽出完了 ({step_weight['テキスト抽出']}%) + チェック完了 ({step_weight['チェック']}%)")
 
-    # セッションステートに保存
-    st.session_state.filtered_results_df = filtered_results_df_local
-    st.session_state.excluded_results_df = excluded_results_df_local
-    st.session_state.filtering_time = filtering_time_local
+        # フィルタリング
+        if not all_df_results_local.empty:
+            st.subheader("チェック結果フィルタリング中...")
+            filtering_progress = st.progress(0)
+            filtering_status_text = st.empty()
+            try:
+                filtered_results_df_local, excluded_results_df_local, filtering_time_local = asyncio.run(
+                    run_async_filter(client, all_df_results_local, chunk_size=5, filtering_progress_bar=filtering_progress, chat_logs_local=st.session_state.chat_logs)
+                )
+            except Exception as e:
+                st.error(f"フィルタリング処理中にエラーが発生しました: {e}")
+                filtered_results_df_local, excluded_results_df_local, filtering_time_local = pd.DataFrame(), pd.DataFrame(), 0.0
 
-    total_end_time = time.time()
-    total_processing_time_local = total_end_time - total_start_time
-    st.session_state.total_processing_time = total_processing_time_local
+            # AIフィルタリングによる除外
+            if not excluded_results_df_local.empty:
+                excluded_results_df_local["除外理由"] = "AIフィルタリングによる"
 
-    # 処理時間表示
-    st.write(f"総処理時間: {total_processing_time_local:.2f} 秒")
-    st.write(f"テキスト抽出処理時間: {extract_time_local:.2f} 秒")
-    st.write(f"チェック処理時間: {check_time_local:.2f} 秒")
-    st.write(f"フィルタリング処理時間: {filtering_time_local:.2f} 秒")
+            # 辞書による除外
+            if not filtered_results_df_local.empty and st.session_state.dictionary_words:
+                in_dict = filtered_results_df_local["指摘箇所"].isin(st.session_state.dictionary_words)
+                dict_excluded = filtered_results_df_local[in_dict].copy()
+                if not dict_excluded.empty:
+                    dict_excluded["除外理由"] = "辞書により除外"
+                    excluded_results_df_local = pd.concat([excluded_results_df_local, dict_excluded], ignore_index=True)
+                    filtered_results_df_local = filtered_results_df_local[~in_dict]
 
-    st.session_state.processing_done = True
+            # ソート
+            if not filtered_results_df_local.empty and "ページ番号" in filtered_results_df_local.columns:
+                filtered_results_df_local.sort_values(by=["ページ番号"], inplace=True)
+            if not excluded_results_df_local.empty and "ページ番号" in excluded_results_df_local.columns:
+                excluded_results_df_local.sort_values(by=["ページ番号"], inplace=True)
+
+            # 結果表示
+            st.write("フィルタリング後のチェック結果:")
+            if filtered_results_df_local.empty:
+                st.write("フィルタリング後に残った指摘事項はありません。")
+            else:
+                display_dataframe(filtered_results_df_local)
+
+            if not excluded_results_df_local.empty:
+                st.write("除外された指摘事項:")
+                st.dataframe(excluded_results_df_local)
+
+            # 全体進捗の更新（フィルタリングステップの完了を反映）
+            overall_progress += step_weight["フィルタリング"]
+            overall_progress = min(overall_progress, 100)
+            overall_progress_bar.progress(overall_progress / 100)
+            overall_status_text.text(f"全体進捗: テキスト抽出完了 ({step_weight['テキスト抽出']}%) + チェック完了 ({step_weight['チェック']}%) + フィルタリング完了 ({step_weight['フィルタリング']}%)")
+
+        else:
+            filtered_results_df_local = pd.DataFrame()
+            excluded_results_df_local = pd.DataFrame()
+            filtering_time_local = 0.0
+
+        # セッションステートに保存
+        st.session_state.filtered_results_df = filtered_results_df_local
+        st.session_state.excluded_results_df = excluded_results_df_local
+        st.session_state.filtering_time = filtering_time_local
+
+        total_end_time = time.time()
+        total_processing_time_local = total_end_time - total_start_time
+        st.session_state.total_processing_time = total_processing_time_local
+
+        # 処理時間表示
+        st.write(f"総処理時間: {total_processing_time_local:.2f} 秒")
+        st.write(f"テキスト抽出処理時間: {extract_time_local:.2f} 秒")
+        st.write(f"チェック処理時間: {check_time_local:.2f} 秒")
+        st.write(f"フィルタリング処理時間: {filtering_time_local:.2f} 秒")
+
+        st.session_state.processing_done = True
 
 # --- 処理完了後の表示・Excelダウンロード ---
 if st.session_state.processing_done:
