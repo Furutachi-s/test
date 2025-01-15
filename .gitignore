@@ -1,0 +1,58 @@
+# --- 全体的な無視ルール ---
+# Pythonの仮想環境を無視
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+
+# Node.js (React) の依存フォルダを無視
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# Djangoのキャッシュやマイグレーションファイルを無視
+db.sqlite3
+*.log
+*.pot
+*.pyc
+*.pyo
+*.env
+media/
+staticfiles/
+
+# IDEやエディタの設定ファイルを無視
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# OS関連ファイルを無視
+.DS_Store
+Thumbs.db
+
+# --- 特定のフォルダやプロジェクト構造に関する設定 ---
+# 無視したいフォルダ全体を指定
+my_project/env/
+portalSandbox/
+test/
+
+# my_project/env 内で追跡したいファイルを例外指定
+!my_project/env/*.py
+!my_project/env/requirements.txt
+
+# Reactアプリで追跡したい設定ファイルを例外指定
+!my_project/frontend/package.json
+!my_project/frontend/webpack.config.js
+!my_project/frontend/.babelrc
+!my_project/frontend/src/
+
+# DjangoやReactで追跡したいファイルを例外指定
+!my_project/backend/manage.py
+!my_project/backend/**/*.py
+!my_project/backend/**/*.html
+!my_project/backend/**/*.css
+!my_project/backend/**/*.js
