@@ -148,8 +148,12 @@ def extract_text_excluding_images_and_header_footer(pdf_document: fitz.Document)
     st.write(f"テキスト抽出処理時間: {extract_time:.2f} 秒")
     return page_texts, extract_time, page_processing_times_local, extracted_texts_local
 
-# --- テキストをチャンクに分割 ---
-def split_text_into_chunks_by_page(page_texts: List[Tuple[int, str]], chunk_size: int = 2000, chunk_overlap: int = 200) -> List[Tuple[int, str]]:
+# --- チャンク分割を大きめに設定 ---
+def split_text_into_chunks_by_page(
+    page_texts: List[Tuple[int, str]],
+    chunk_size: int = 4000,      # ← 1チャンクあたりを大きくし、呼び出し回数を減らす
+    chunk_overlap: int = 100     # ← 必要に応じてオーバーラップを小さくし、チャンク数をさらに減らす
+) -> List[Tuple[int, str]]:
     """ページごとのテキストをチャンクに分割する。"""
     try:
         encoding = tiktoken.encoding_for_model(model_selection)
@@ -170,19 +174,15 @@ def get_chat_completion_params() -> Dict[str, Any]:
     モデルに応じてOpenAI API呼び出しのパラメータを設定する。
     """
     if model_selection == "o1-preview":
-        # temperatureを1に固定
         return {
             "max_completion_tokens": 2000,
             "temperature": 1
         }
     elif model_selection.startswith("o1"):
-        # o1-miniなどのo1系モデルではtemperatureを指定しない
         return {
             "max_completion_tokens": 2000
-            # temperatureはデフォルト値（1）を使用
         }
     else:
-        # gpt-4oなど4o系モデル
         return {
             "max_tokens": 2000,
             "temperature": 0
@@ -219,6 +219,7 @@ def parse_json_results_to_dataframe(results: str, page_num: int) -> pd.DataFrame
             "重要度": error.get("importance", ""),
             "検出元指示": error.get("prompt_source", "")
         }
+        # 1つでも値が入っていれば追加
         if any(val for val in issue.values()):
             issues.append(issue)
 
@@ -402,11 +403,11 @@ async def async_filter_chunk_with_openai(client: AzureOpenAI, df_chunk: pd.DataF
                     return [], []
 
 # --- OpenAI API呼び出し(非同期): チェック実行 ---
-async def run_async_check(client: AzureOpenAI, page_chunks: List[Tuple[int, str]], check_progress_bar: st.progress, check_status_text: st.empty, chat_logs_local: List[Dict[str, Any]]) -> Tuple[List[Tuple[int, str]], float]:
+async def run_async_check(client: AzureOpenAI, page_chunks: List[Tuple[int, str]], progress_bar: st.progress, check_status_text: st.empty, chat_logs_local: List[Dict[str, Any]]) -> Tuple[List[Tuple[int, str]], float]:
     """非同期でチェックを実行する。"""
     non_empty_chunks = [(p, t) for p, t in page_chunks if t.strip()]
-    semaphore = asyncio.Semaphore(5)
-    
+    semaphore = asyncio.Semaphore(5)  # 同時に走るタスクの上限
+
     tasks = [
         asyncio.create_task(
             async_check_text_with_openai(client, chunk_text, page_num, semaphore, chat_logs_local)
@@ -423,31 +424,31 @@ async def run_async_check(client: AzureOpenAI, page_chunks: List[Tuple[int, str]
     check_start_time = time.time()
     results = []
     check_status_text.text("チェック処理を開始します...")
-    check_progress_bar.progress(0.0)
+    progress_bar.progress(0.0)
 
     for task in asyncio.as_completed(tasks):
         page_num, result = await task
         results.append((page_num, result))
         completed += 1
         progress = completed / total_tasks
-        check_progress_bar.progress(progress)
+        progress_bar.progress(progress)
         check_status_text.text(f"チェック中... {completed}/{total_tasks} チャンク完了")
 
     check_end_time = time.time()
     check_time_local = check_end_time - check_start_time
     check_status_text.text(f"チェックが完了しました！ (処理時間: {check_time_local:.2f} 秒)")
-    check_progress_bar.progress(1.0)
+    progress_bar.progress(1.0)
 
     return results, check_time_local
 
 # --- フィルタリング実行(非同期) ---
-async def run_async_filter(client: AzureOpenAI, df_results: pd.DataFrame, chunk_size: int, filtering_progress_bar: st.progress, chat_logs_local: List[Dict[str, Any]]) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
+async def run_async_filter(client: AzureOpenAI, df_results: pd.DataFrame, chunk_size: int, progress_bar: st.progress, chat_logs_local: List[Dict[str, Any]]) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
     """非同期でフィルタリングを実行する。"""
     filtered_results_list = []
     excluded_results_list = []
     total_results = len(df_results)
     if total_results == 0:
-        filtering_progress_bar.progress(1.0)
+        progress_bar.progress(1.0)
         return pd.DataFrame(), pd.DataFrame(), 0.0
 
     filtering_start_time = time.time()
@@ -455,7 +456,7 @@ async def run_async_filter(client: AzureOpenAI, df_results: pd.DataFrame, chunk_
 
     filter_status_text = st.empty()
     filter_status_text.text("フィルタリング中...")
-    filtering_progress_bar.progress(0.0)
+    progress_bar.progress(0.0)
 
     semaphore = asyncio.Semaphore(5)
     tasks = [
@@ -472,7 +473,7 @@ async def run_async_filter(client: AzureOpenAI, df_results: pd.DataFrame, chunk_
         excluded_results_list.extend(e_chunk)
         completed += 1
         progress = completed / num_chunks
-        filtering_progress_bar.progress(progress)
+        progress_bar.progress(progress)
         filter_status_text.text(f"フィルタリング中... {completed}/{num_chunks} チャンク完了")
 
     filtering_end_time = time.time()
@@ -507,8 +508,8 @@ def add_location_info(df: pd.DataFrame, extracted_texts: List[Dict[str, Any]]) -
             # 近似検索（スペース区切り）
             words = err_loc.split()
             candidates = [full_text.find(w) for w in words if w and full_text.find(w) != -1]
-            if candidates:
-                idx = min(candidates)
+            idx = min(candidates) if candidates else -1
+
         if idx == -1:
             continue
 
@@ -548,7 +549,7 @@ def create_readable_chat_dataframe(chat_logs_local: List[Dict[str, Any]]) -> pd.
     return pd.DataFrame(records)
 
 # --- アプリタイトル ---
-st.title("文章AIチェックシステム_調整版")
+st.title("文章AIチェックシステム_チャンクサイズ増設定版")
 
 # --- ファイルアップロードセクション ---
 st.header("ファイルのアップロード")
@@ -558,39 +559,41 @@ uploaded_file = st.file_uploader("PDFファイルをアップロードしてく�
 
 # --- 辞書ファイルアップロードUI ---
 dictionary_file = None
-if uploaded_file is not None and st.session_state.uploaded_pdf_data is None:
+if uploaded_file is not None:
     st.write("【任意】辞書用Excelファイル(除外用ワード一覧)をアップロードする場合はA列にワードを入れてください:")
     dictionary_file = st.file_uploader("辞書ファイル(Excel形式)", type=["xlsx", "xls"], key="dict_uploader")
 
 # --- 処理開始ボタン ---
-if uploaded_file is not None and not st.session_state.processing_done:
+if uploaded_file is not None:
     if st.button("処理開始"):
-        # PDF読み込み
-        try:
-            st.session_state.uploaded_pdf_data = uploaded_file.read()
-            st.success("PDFファイルを正常にアップロードしました。")
-        except Exception as e:
-            st.error(f"PDFファイルの読み込みに失敗しました: {e}")
-            st.stop()
-        
-        # 辞書ファイル読み込み
-        if dictionary_file is not None:
+        if st.session_state.processing_done:
+            st.warning("既に処理が完了しています。新しいファイルをアップロードしてください。")
+        else:
+            # PDF読み込み
             try:
-                dict_df = pd.read_excel(dictionary_file, sheet_name=0, header=None)
-                dict_df = dict_df.dropna(subset=[0])
-                st.session_state.dictionary_words = set(dict_df[0].astype(str).str.strip().tolist())
-                st.success("辞書ファイルを正常に読み込みました。")
+                st.session_state.uploaded_pdf_data = uploaded_file.read()
+                st.success("PDFファイルを正常にアップロードしました。")
             except Exception as e:
-                st.error(f"辞書ファイルの読み込みに失敗しました: {e}")
+                st.error(f"PDFファイルの読み込みに失敗しました: {e}")
                 st.stop()
-        
-        # 処理を開始
-        st.session_state.processing_done = False  # 再度処理が開始される場合に備える
+            
+            # 辞書ファイル読み込み
+            if dictionary_file is not None:
+                try:
+                    dict_df = pd.read_excel(dictionary_file, sheet_name=0, header=None)
+                    dict_df = dict_df.dropna(subset=[0])
+                    st.session_state.dictionary_words = set(dict_df[0].astype(str).str.strip().tolist())
+                    st.success("辞書ファイルを正常に読み込みました。")
+                except Exception as e:
+                    st.error(f"辞書ファイルの読み込みに失敗しました: {e}")
+                    st.stop()
+            
+            # 処理を開始
+            st.session_state.processing_done = False  # 再度処理が開始される場合に備える
 
-# --- リセットボタン ---
-if st.button("リセット"):
-    initialize_session_state()
-    st.experimental_rerun()
+# --- メイン処理開始用ボタン ---
+if st.session_state.uploaded_pdf_data is not None and not st.session_state.processing_done and st.button("開始済みでない場合はここをクリック"):
+    pass
 
 # --- メイン処理 ---
 if st.session_state.uploaded_pdf_data is not None and not st.session_state.processing_done:
@@ -614,26 +617,13 @@ if st.session_state.uploaded_pdf_data is not None and not st.session_state.proce
         st.session_state.extracted_texts = extracted_texts_local
         st.session_state.extract_time = extract_time_local
 
-        # チャンク分割
-        page_chunks = split_text_into_chunks_by_page(page_texts)
+        # チャンク分割（chunk_size=4000, chunk_overlap=100）
+        page_chunks = split_text_into_chunks_by_page(
+            page_texts,
+            chunk_size=4000,
+            chunk_overlap=100
+        )
         st.write(f"チャンク分割数: {len(page_chunks)}")
-
-        # 全体進捗表示
-        st.subheader("全体の進捗状況")
-        overall_progress_bar = st.progress(0.0)
-        overall_status_text = st.empty()
-
-        # 各ステップの進捗を管理するためのステータス変数
-        steps = ["テキスト抽出", "チェック", "フィルタリング"]
-        step_progress = {"テキスト抽出": 100, "チェック": 0, "フィルタリング": 0}
-
-        # テキスト抽出完了時に進捗を更新
-        # 既にテキスト抽出が完了しているため、全体進捗をテキスト抽出分として更新
-        step_weight = {"テキスト抽出": 30, "チェック": 50, "フィルタリング": 20}
-        overall_progress = 0
-        overall_progress += step_weight["テキスト抽出"]
-        overall_progress_bar.progress(overall_progress / 100)
-        overall_status_text.text(f"全体進捗: テキスト抽出完了 ({step_weight['テキスト抽出']}%)")
 
         # チェック進捗表示
         st.subheader("チェック進捗状況")
@@ -668,28 +658,16 @@ if st.session_state.uploaded_pdf_data is not None and not st.session_state.proce
         if not all_df_results_local.empty and "ページ番号" in all_df_results_local.columns:
             all_df_results_local = add_location_info(all_df_results_local, st.session_state.extracted_texts)
             all_df_results_local.sort_values(by=["ページ番号"], inplace=True)
-            st.write("フィルタリング前のチェック結果:")
-            st.dataframe(all_df_results_local)
-        else:
-            st.write("指摘事項がありませんでした。")
-            all_df_results_local = pd.DataFrame()
 
         st.session_state.all_df_results = all_df_results_local
-
-        # 全体進捗の更新（チェックステップの完了度を反映）
-        overall_progress += step_weight["チェック"] * (len(results) / len(page_chunks))
-        overall_progress = min(overall_progress, 100)
-        overall_progress_bar.progress(overall_progress / 100)
-        overall_status_text.text(f"全体進捗: テキスト抽出完了 ({step_weight['テキスト抽出']}%) + チェック完了 ({step_weight['チェック']}%)")
 
         # フィルタリング
         if not all_df_results_local.empty:
             st.subheader("チェック結果フィルタリング中...")
             filtering_progress = st.progress(0)
-            filtering_status_text = st.empty()
             try:
                 filtered_results_df_local, excluded_results_df_local, filtering_time_local = asyncio.run(
-                    run_async_filter(client, all_df_results_local, chunk_size=5, filtering_progress_bar=filtering_progress, chat_logs_local=st.session_state.chat_logs)
+                    run_async_filter(client, all_df_results_local, chunk_size=5, progress_bar=filtering_progress, chat_logs_local=st.session_state.chat_logs)
                 )
             except Exception as e:
                 st.error(f"フィルタリング処理中にエラーが発生しました: {e}")
@@ -713,24 +691,6 @@ if st.session_state.uploaded_pdf_data is not None and not st.session_state.proce
                 filtered_results_df_local.sort_values(by=["ページ番号"], inplace=True)
             if not excluded_results_df_local.empty and "ページ番号" in excluded_results_df_local.columns:
                 excluded_results_df_local.sort_values(by=["ページ番号"], inplace=True)
-
-            # 結果表示
-            st.write("フィルタリング後のチェック結果:")
-            if filtered_results_df_local.empty:
-                st.write("フィルタリング後に残った指摘事項はありません。")
-            else:
-                display_dataframe(filtered_results_df_local)
-
-            if not excluded_results_df_local.empty:
-                st.write("除外された指摘事項:")
-                st.dataframe(excluded_results_df_local)
-
-            # 全体進捗の更新（フィルタリングステップの完了を反映）
-            overall_progress += step_weight["フィルタリング"]
-            overall_progress = min(overall_progress, 100)
-            overall_progress_bar.progress(overall_progress / 100)
-            overall_status_text.text(f"全体進捗: テキスト抽出完了 ({step_weight['テキスト抽出']}%) + チェック完了 ({step_weight['チェック']}%) + フィルタリング完了 ({step_weight['フィルタリング']}%)")
-
         else:
             filtered_results_df_local = pd.DataFrame()
             excluded_results_df_local = pd.DataFrame()
@@ -745,16 +705,25 @@ if st.session_state.uploaded_pdf_data is not None and not st.session_state.proce
         total_processing_time_local = total_end_time - total_start_time
         st.session_state.total_processing_time = total_processing_time_local
 
-        # 処理時間表示
-        st.write(f"総処理時間: {total_processing_time_local:.2f} 秒")
-        st.write(f"テキスト抽出処理時間: {extract_time_local:.2f} 秒")
-        st.write(f"チェック処理時間: {check_time_local:.2f} 秒")
-        st.write(f"フィルタリング処理時間: {filtering_time_local:.2f} 秒")
-
         st.session_state.processing_done = True
 
 # --- 処理完了後の表示・Excelダウンロード ---
 if st.session_state.processing_done:
+    st.write(f"総処理時間: {st.session_state.total_processing_time:.2f} 秒")
+    st.write(f"テキスト抽出処理時間: {st.session_state.extract_time:.2f} 秒")
+    st.write(f"チェック処理時間: {st.session_state.check_time:.2f} 秒")
+    st.write(f"フィルタリング処理時間: {st.session_state.filtering_time:.2f} 秒")
+
+    if not st.session_state.filtered_results_df.empty:
+        st.subheader("フィルタリング後のチェック結果")
+        display_dataframe(st.session_state.filtered_results_df)
+    else:
+        st.write("フィルタリング後のチェック結果はありません。")
+
+    if not st.session_state.excluded_results_df.empty:
+        st.subheader("除外された指摘事項")
+        display_dataframe(st.session_state.excluded_results_df)
+
     excel_filtered = st.session_state.filtered_results_df if not st.session_state.filtered_results_df.empty else pd.DataFrame()
     excel_excluded = st.session_state.excluded_results_df if not st.session_state.excluded_results_df.empty else pd.DataFrame()
     excel_all = st.session_state.all_df_results if not st.session_state.all_df_results.empty else pd.DataFrame()
@@ -797,3 +766,13 @@ if st.session_state.processing_done:
         file_name="チェック結果_フィルタリングあり.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
+    # --- リセットボタン ---
+    if st.button("リセットしてもう一度チェックする"):
+        st.session_state.all_df_results = pd.DataFrame()
+        st.session_state.filtered_results_df = pd.DataFrame()
+        st.session_state.excluded_results_df = pd.DataFrame()
+        st.session_state.chat_logs = []
+        st.session_state.processing_done = False
+        st.warning("処理結果をリセットしました。再度チェックが実行可能です。")
+        st.stop()
